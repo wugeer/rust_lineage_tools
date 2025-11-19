@@ -127,16 +127,16 @@ fn allow_base_fallback_for_item(item: &SelectItem, rctx: &ResolveCtx) -> bool {
             Expr::Identifier(_) => allow = true,
             Expr::CompoundIdentifier(ids) if ids.len() == 1 => allow = true,
             Expr::CompoundIdentifier(ids) if ids.len() == 2 => {
-                let qual = ident_to_string(&ids[0]);
-                let col = ident_to_string(&ids[1]);
-                if let Some(info) = rctx.derived_aliases.get(&qual) {
-                    if info.exprs.contains_key(&col) {
+                let qual = &ids[0].value;
+                let col = &ids[1].value;
+                if let Some(info) = rctx.derived_aliases.get(qual) {
+                    if info.exprs.contains_key(col) {
                         allow = false;
                     }
                 }
-                if let Some(cte_name) = rctx.cte_aliases.get(&qual) {
+                if let Some(cte_name) = rctx.cte_aliases.get(qual) {
                     if let Some(info) = rctx.cte_defs.defs.get(cte_name) {
-                        if info.exprs.contains_key(&col) {
+                        if info.exprs.contains_key(col) {
                             allow = false;
                         }
                     }
@@ -147,16 +147,16 @@ fn allow_base_fallback_for_item(item: &SelectItem, rctx: &ResolveCtx) -> bool {
     }
     if let SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) = item {
         if idents.len() == 2 {
-            let qual = ident_to_string(&idents[0]);
-            let col = ident_to_string(&idents[1]);
-            if let Some(info) = rctx.derived_aliases.get(&qual) {
-                if info.exprs.contains_key(&col) {
+            let qual = &idents[0].value;
+            let col = &idents[1].value;
+            if let Some(info) = rctx.derived_aliases.get(qual) {
+                if info.exprs.contains_key(col) {
                     allow = false;
                 }
             }
-            if let Some(cte_name) = rctx.cte_aliases.get(&qual) {
+            if let Some(cte_name) = rctx.cte_aliases.get(qual) {
                 if let Some(info) = rctx.cte_defs.defs.get(cte_name) {
-                    if info.exprs.contains_key(&col) {
+                    if info.exprs.contains_key(col) {
                         allow = false;
                     }
                 }
@@ -987,12 +987,11 @@ fn merge_derived_info_for_set(left: DerivedInfo, right: DerivedInfo) -> Result<D
         if let Some(Some(rs)) = right.sources_by_index.get(i) {
             merged.extend(rs.iter().cloned());
         }
-        let col_name = out.columns[i].clone();
         if !merged.is_empty() {
             let rc_merged = Rc::new(merged);
             out.sources_by_index[i] = Some(rc_merged.clone());
             out.exprs_by_index[i] = None;
-            out.sources.insert(col_name, rc_merged);
+            out.sources.insert(out.columns[i].clone(), rc_merged);
         } else {
             let expr = left
                 .exprs_by_index
@@ -1003,7 +1002,7 @@ fn merge_derived_info_for_set(left: DerivedInfo, right: DerivedInfo) -> Result<D
             if !expr.is_empty() {
                 out.exprs_by_index[i] = Some(expr.clone());
                 out.sources_by_index[i] = None;
-                out.exprs.insert(col_name, expr);
+                out.exprs.insert(out.columns[i].clone(), expr);
             }
         }
     }
@@ -1390,15 +1389,14 @@ fn analyze_select_info(ctx: &Context, select: &Select, cte_defs: &CteDefs) -> Re
             has_any_col = true;
         }
 
-        let col_name = info.columns[i].clone();
         if has_any_col {
             let rc_sources = Rc::new(sources);
-            info.sources.insert(col_name, rc_sources.clone());
+            info.sources.insert(info.columns[i].clone(), rc_sources.clone());
             info.sources_by_index[i] = Some(rc_sources);
             info.exprs_by_index[i] = None;
         } else {
             let expr_sql = select_item_expr_sql_with_ctx(&exp.item, &rctx)?;
-            info.exprs.insert(col_name, expr_sql.clone());
+            info.exprs.insert(info.columns[i].clone(), expr_sql.clone());
             info.exprs_by_index[i] = Some(expr_sql);
             info.sources_by_index[i] = None;
         }
@@ -1669,7 +1667,7 @@ fn collect_columns_from_expr_with_cte(
             }
             Some(DefaultOnly::Cte(cte_name)) => {
                 if let Some(info) = rctx.cte_defs.defs.get(cte_name) {
-                    if let Some(srcs) = info.sources.get(&ident_to_string(ident)) {
+                    if let Some(srcs) = info.sources.get(&ident.value) {
                         for s in srcs.iter() {
                             acc.insert(s.clone());
                         }
@@ -1678,7 +1676,7 @@ fn collect_columns_from_expr_with_cte(
             }
             Some(DefaultOnly::Derived(derived_name)) => {
                 if let Some(info) = rctx.derived_aliases.get(derived_name) {
-                    if let Some(srcs) = info.sources.get(&ident_to_string(ident)) {
+                    if let Some(srcs) = info.sources.get(&ident.value) {
                         for s in srcs.iter() {
                             acc.insert(s.clone());
                         }
@@ -1689,23 +1687,23 @@ fn collect_columns_from_expr_with_cte(
         },
         Expr::CompoundIdentifier(idents) => {
             if idents.len() == 2 {
-                let qualifier = ident_to_string(&idents[0]);
-                let col = ident_to_string(&idents[1]);
-                if let Some(tbl) = rctx.alias_map.get(&qualifier) {
+                let qualifier = &idents[0].value;
+                let col = &idents[1].value;
+                if let Some(tbl) = rctx.alias_map.get(qualifier) {
                     acc.insert(ColumnRef {
                         table: tbl.clone(),
-                        column: col,
+                        column: col.clone(),
                     });
-                } else if let Some(cte_name) = rctx.cte_aliases.get(&qualifier) {
+                } else if let Some(cte_name) = rctx.cte_aliases.get(qualifier) {
                     if let Some(info) = rctx.cte_defs.defs.get(cte_name) {
-                        if let Some(srcs) = info.sources.get(&col) {
+                        if let Some(srcs) = info.sources.get(col) {
                             for s in srcs.iter() {
                                 acc.insert(s.clone());
                             }
                         }
                     }
-                } else if let Some(info) = rctx.derived_aliases.get(&qualifier) {
-                    if let Some(srcs) = info.sources.get(&col) {
+                } else if let Some(info) = rctx.derived_aliases.get(qualifier) {
+                    if let Some(srcs) = info.sources.get(col) {
                         for s in srcs.iter() {
                             acc.insert(s.clone());
                         }
