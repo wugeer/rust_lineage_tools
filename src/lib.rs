@@ -9,8 +9,10 @@ use sqlparser::ast::{
 use sqlparser::dialect::HiveDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Span;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 struct TableKey {
@@ -53,7 +55,7 @@ struct Context {
 struct CteInfo {
     columns: Vec<String>,
     // column name -> resolved physical column sources
-    sources: HashMap<String, BTreeSet<ColumnRef>>,
+    sources: HashMap<String, Rc<BTreeSet<ColumnRef>>>,
     // column name -> original expression string when there are no sources
     exprs: HashMap<String, String>,
 }
@@ -68,11 +70,223 @@ struct CteDefs {
 struct DerivedInfo {
     columns: Vec<String>,
     // name-based lookup (may overwrite on duplicate names)
-    sources: HashMap<String, BTreeSet<ColumnRef>>,
+    sources: HashMap<String, Rc<BTreeSet<ColumnRef>>>,
     exprs: HashMap<String, String>,
     // index-preserving slots to handle duplicate output names
-    sources_by_index: Vec<Option<BTreeSet<ColumnRef>>>,
+    sources_by_index: Vec<Option<Rc<BTreeSet<ColumnRef>>>>,
     exprs_by_index: Vec<Option<String>>,
+}
+
+/// Indicates a single, mutually-exclusive default resolution scope for bare identifiers.
+/// Only one of these can be active at a time: a physical table, a CTE, or a derived subquery.
+#[derive(Debug, Copy, Clone)]
+enum DefaultOnly<'a> {
+    Table(&'a TableKey),
+    Cte(&'a str),
+    Derived(&'a str),
+}
+
+/// Shared resolution context threaded through expression walkers.
+/// Bundles all maps and options to keep function signatures small and consistent.
+#[derive(Debug, Copy, Clone)]
+struct ResolveCtx<'a> {
+    alias_map: &'a HashMap<String, TableKey>,
+    cte_aliases: &'a HashMap<String, String>,
+    derived_aliases: &'a HashMap<String, DerivedInfo>,
+    cte_defs: &'a CteDefs,
+    named_windows: Option<&'a HashMap<String, ast::WindowSpec>>,
+    default_only: Option<DefaultOnly<'a>>,
+}
+
+/// Convenience constructor for `ResolveCtx`.
+fn make_resolve_ctx<'a>(
+    alias_map: &'a HashMap<String, TableKey>,
+    cte_aliases: &'a HashMap<String, String>,
+    derived_aliases: &'a HashMap<String, DerivedInfo>,
+    cte_defs: &'a CteDefs,
+    named_windows: Option<&'a HashMap<String, ast::WindowSpec>>,
+    default_only: Option<DefaultOnly<'a>>,
+) -> ResolveCtx<'a> {
+    ResolveCtx {
+        alias_map,
+        cte_aliases,
+        derived_aliases,
+        cte_defs,
+        named_windows,
+        default_only,
+    }
+}
+
+/// Returns whether the projection item can fall back to base tables when
+/// no concrete sources were found (e.g. unnamed simple expressions).
+fn allow_base_fallback_for_item(item: &SelectItem, rctx: &ResolveCtx) -> bool {
+    let mut allow = matches!(item, SelectItem::UnnamedExpr(_));
+    // Allow fallback for aliased simple identifiers too, e.g., `n AS name`
+    if let SelectItem::ExprWithAlias { expr, .. } = item {
+        match expr {
+            Expr::Identifier(_) => allow = true,
+            Expr::CompoundIdentifier(ids) if ids.len() == 1 => allow = true,
+            Expr::CompoundIdentifier(ids) if ids.len() == 2 => {
+                let qual = ident_to_string(&ids[0]);
+                let col = ident_to_string(&ids[1]);
+                if let Some(info) = rctx.derived_aliases.get(&qual) {
+                    if info.exprs.contains_key(&col) {
+                        allow = false;
+                    }
+                }
+                if let Some(cte_name) = rctx.cte_aliases.get(&qual) {
+                    if let Some(info) = rctx.cte_defs.defs.get(cte_name) {
+                        if info.exprs.contains_key(&col) {
+                            allow = false;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) = item {
+        if idents.len() == 2 {
+            let qual = ident_to_string(&idents[0]);
+            let col = ident_to_string(&idents[1]);
+            if let Some(info) = rctx.derived_aliases.get(&qual) {
+                if info.exprs.contains_key(&col) {
+                    allow = false;
+                }
+            }
+            if let Some(cte_name) = rctx.cte_aliases.get(&qual) {
+                if let Some(info) = rctx.cte_defs.defs.get(cte_name) {
+                    if info.exprs.contains_key(&col) {
+                        allow = false;
+                    }
+                }
+            }
+        }
+    }
+    allow
+}
+
+/// If the item is not from a wildcard and sources are empty, try to fill sources by:
+/// 1) Using the default table scope when present; otherwise
+/// 2) Falling back to all base tables in scope (when `allow_base_fallback` is true).
+///    Returns whether any sources were added.
+fn maybe_fill_sources_for_empty(
+    item: &SelectItem,
+    is_from_wildcard: bool,
+    rctx: &ResolveCtx,
+    sources: &mut BTreeSet<ColumnRef>,
+    allow_base_fallback: bool,
+    base_tables_pre: Option<&BTreeSet<TableKey>>,
+) -> Result<bool> {
+    let mut added = false;
+    if !is_from_wildcard && sources.is_empty() {
+        if let Some(DefaultOnly::Table(single_tbl)) = rctx.default_only {
+            let expr_sql = select_item_expr_sql_with_ctx(item, rctx)?;
+            sources.insert(ColumnRef {
+                table: (*single_tbl).clone(),
+                column: expr_sql,
+            });
+            added = true;
+        } else if allow_base_fallback && allow_base_fallback_for_item(item, rctx) {
+            // Prefer base tables from a single derived alias in scope, if present,
+            // to better attribute bare identifiers to that subquery's sources.
+            let preferred_from_single_derived: Option<BTreeSet<TableKey>> =
+                if rctx.derived_aliases.len() == 1 {
+                    let info = rctx.derived_aliases.values().next().unwrap();
+                    let mut set: BTreeSet<TableKey> = BTreeSet::new();
+                    for srcs in info.sources.values() {
+                        for s in srcs.iter() {
+                            set.insert(s.table.clone());
+                        }
+                    }
+                    if !set.is_empty() {
+                        Some(set)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+            let base_tables: Cow<'_, BTreeSet<TableKey>> =
+                if let Some(pref) = preferred_from_single_derived {
+                    // Union preferred derived sources with all other base tables visible in scope
+                    let mut union_set: BTreeSet<TableKey> = pref;
+                    if let Some(pre) = base_tables_pre {
+                        for t in pre {
+                            union_set.insert(t.clone());
+                        }
+                    } else {
+                        let others = collect_base_tables_in_scope(
+                            rctx.alias_map,
+                            rctx.cte_aliases,
+                            rctx.derived_aliases,
+                            rctx.cte_defs,
+                        );
+                        for t in others {
+                            union_set.insert(t);
+                        }
+                    }
+                    Cow::Owned(union_set)
+                } else if let Some(pre) = base_tables_pre {
+                    Cow::Borrowed(pre)
+                } else {
+                    Cow::Owned(collect_base_tables_in_scope(
+                        rctx.alias_map,
+                        rctx.cte_aliases,
+                        rctx.derived_aliases,
+                        rctx.cte_defs,
+                    ))
+                };
+            if !base_tables.is_empty() {
+                // Prefer to propagate bare identifier name when possible (e.g. `id` -> t1.id, t2.id)
+                let fallback_col = match item {
+                    SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => {
+                        match expr {
+                            Expr::Identifier(ident) => Some(ident_to_string(ident)),
+                            Expr::CompoundIdentifier(idents) if idents.len() == 1 => {
+                                Some(ident_to_string(&idents[0]))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+                .unwrap_or_else(|| "*".to_string());
+
+                *sources = base_tables
+                    .iter()
+                    .cloned()
+                    .map(|t| ColumnRef {
+                        table: t,
+                        column: fallback_col.clone(),
+                    })
+                    .collect();
+                added = true;
+            }
+        }
+    }
+    Ok(added)
+}
+
+fn compute_base_tables_in_scope(rctx: &ResolveCtx) -> BTreeSet<TableKey> {
+    collect_base_tables_in_scope(
+        rctx.alias_map,
+        rctx.cte_aliases,
+        rctx.derived_aliases,
+        rctx.cte_defs,
+    )
+}
+
+fn pick_default_only<'a>(
+    default_only_table: Option<&'a TableKey>,
+    default_only_cte: Option<&'a String>,
+    default_only_derived: Option<&'a String>,
+) -> Option<DefaultOnly<'a>> {
+    default_only_table
+        .map(DefaultOnly::Table)
+        .or_else(|| default_only_cte.map(|c| DefaultOnly::Cte(c.as_str())))
+        .or_else(|| default_only_derived.map(|d| DefaultOnly::Derived(d.as_str())))
 }
 
 #[derive(Debug, Clone)]
@@ -116,9 +330,8 @@ pub fn analyze_sql_lineage(sql: &str) -> Result<Vec<String>> {
                     let (db, table) = qualify_table(&ctx, name)?;
                     let target_table = TableKey { db, table };
 
-                    let select = expect_simple_select(q)?;
                     let cte_defs = build_cte_defs(&ctx, q)?;
-                    let info = analyze_select_info(&ctx, select, &cte_defs)?;
+                    let info = analyze_query_info(&ctx, q, &cte_defs)?;
                     for (i, col) in info.columns.iter().enumerate() {
                         let target_col = TargetCol {
                             table: target_table.clone(),
@@ -161,9 +374,8 @@ pub fn analyze_sql_lineage(sql: &str) -> Result<Vec<String>> {
                         .source
                         .as_ref()
                         .ok_or_else(|| anyhow!("INSERT missing source SELECT"))?;
-                    let select = expect_simple_select(source_q)?;
                     let cte_defs = build_cte_defs(&ctx, source_q)?;
-                    let info = analyze_select_info(&ctx, select, &cte_defs)?;
+                    let info = analyze_query_info(&ctx, source_q, &cte_defs)?;
                     info.columns.clone()
                 };
 
@@ -171,9 +383,8 @@ pub fn analyze_sql_lineage(sql: &str) -> Result<Vec<String>> {
                     .source
                     .as_ref()
                     .ok_or_else(|| anyhow!("INSERT missing source SELECT"))?;
-                let select = expect_simple_select(source_q)?;
                 let cte_defs = build_cte_defs(&ctx, source_q)?;
-                let info = analyze_select_info(&ctx, select, &cte_defs)?;
+                let info = analyze_query_info(&ctx, source_q, &cte_defs)?;
                 if target_cols.len() != info.columns.len() {
                     bail!(
                         "Target columns count ({}) does not match SELECT projection ({}) for table {}.{}",
@@ -208,9 +419,8 @@ pub fn analyze_sql_lineage(sql: &str) -> Result<Vec<String>> {
             } => {
                 let (db, table) = qualify_table(&ctx, &name)?;
                 let target_table = TableKey { db, table };
-                let select = expect_simple_select(&query)?;
                 let cte_defs = build_cte_defs(&ctx, &query)?;
-                let info = analyze_select_info(&ctx, select, &cte_defs)?;
+                let info = analyze_query_info(&ctx, &query, &cte_defs)?;
                 let target_cols: Vec<String> = if !columns.is_empty() {
                     columns.iter().map(|c| ident_to_string(&c.name)).collect()
                 } else {
@@ -288,16 +498,8 @@ pub fn analyze_sql_tables(sql: &str) -> Result<Vec<String>> {
                         db: tdb,
                         table: ttable,
                     };
-                    let select = expect_simple_select(q)?;
                     let cte_defs = build_cte_defs(&ctx, q)?;
-                    let (alias_map, cte_aliases, derived_aliases) =
-                        build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                    let sources = collect_base_tables_in_scope(
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &cte_defs,
-                    );
+                    let sources = collect_base_tables_in_query(&ctx, q, &cte_defs)?;
                     let s = sources
                         .iter()
                         .map(|t| format!("{}.{}", t.db, t.table))
@@ -313,16 +515,8 @@ pub fn analyze_sql_tables(sql: &str) -> Result<Vec<String>> {
                 };
                 let target = TableKey { db, table };
                 if let Some(source_q) = ins.source.as_ref() {
-                    let select = expect_simple_select(source_q)?;
                     let cte_defs = build_cte_defs(&ctx, source_q)?;
-                    let (alias_map, cte_aliases, derived_aliases) =
-                        build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                    let sources = collect_base_tables_in_scope(
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &cte_defs,
-                    );
+                    let sources = collect_base_tables_in_query(&ctx, source_q, &cte_defs)?;
                     let s = sources
                         .iter()
                         .map(|t| format!("{}.{}", t.db, t.table))
@@ -340,16 +534,8 @@ pub fn analyze_sql_tables(sql: &str) -> Result<Vec<String>> {
                 // columns ignored for table-level lineage; compute sources
                 let (db, table) = qualify_table(&ctx, &name)?;
                 let target = TableKey { db, table };
-                let select = expect_simple_select(&query)?;
                 let cte_defs = build_cte_defs(&ctx, &query)?;
-                let (alias_map, cte_aliases, derived_aliases) =
-                    build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                let sources = collect_base_tables_in_scope(
-                    &alias_map,
-                    &cte_aliases,
-                    &derived_aliases,
-                    &cte_defs,
-                );
+                let sources = collect_base_tables_in_query(&ctx, &query, &cte_defs)?;
                 let s = sources
                     .iter()
                     .map(|t| format!("{}.{}", t.db, t.table))
@@ -413,21 +599,12 @@ pub fn analyze_sql_tables_detailed(sql: &str) -> Result<Vec<TableStmtInfo>> {
                         db: tdb,
                         table: ttable,
                     };
-                    let select = expect_simple_select(q)?;
                     let cte_defs = build_cte_defs(&ctx, q)?;
-                    let (alias_map, cte_aliases, derived_aliases) =
-                        build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                    let sources = collect_base_tables_in_scope(
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &cte_defs,
-                    );
-                    let mut srcs: Vec<String> = sources
+                    let sources = collect_base_tables_in_query(&ctx, q, &cte_defs)?;
+                    let srcs: Vec<String> = sources
                         .iter()
                         .map(|t| format!("{}.{}", t.db, t.table))
                         .collect();
-                    srcs.sort();
                     out.push(TableStmtInfo {
                         stmt_type: "CTAS".to_string(),
                         start_line: span.start.line as u32,
@@ -447,21 +624,12 @@ pub fn analyze_sql_tables_detailed(sql: &str) -> Result<Vec<TableStmtInfo>> {
                 };
                 let target = TableKey { db, table };
                 if let Some(source_q) = ins.source.as_ref() {
-                    let select = expect_simple_select(source_q)?;
                     let cte_defs = build_cte_defs(&ctx, source_q)?;
-                    let (alias_map, cte_aliases, derived_aliases) =
-                        build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                    let sources = collect_base_tables_in_scope(
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &cte_defs,
-                    );
-                    let mut srcs: Vec<String> = sources
+                    let sources = collect_base_tables_in_query(&ctx, source_q, &cte_defs)?;
+                    let srcs: Vec<String> = sources
                         .iter()
                         .map(|t| format!("{}.{}", t.db, t.table))
                         .collect();
-                    srcs.sort();
                     out.push(TableStmtInfo {
                         stmt_type: "INSERT".to_string(),
                         start_line: span.start.line as u32,
@@ -482,21 +650,12 @@ pub fn analyze_sql_tables_detailed(sql: &str) -> Result<Vec<TableStmtInfo>> {
             } => {
                 let (db, table) = qualify_table(&ctx, &name)?;
                 let target = TableKey { db, table };
-                let select = expect_simple_select(&query)?;
                 let cte_defs = build_cte_defs(&ctx, &query)?;
-                let (alias_map, cte_aliases, derived_aliases) =
-                    build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                let sources = collect_base_tables_in_scope(
-                    &alias_map,
-                    &cte_aliases,
-                    &derived_aliases,
-                    &cte_defs,
-                );
-                let mut srcs: Vec<String> = sources
+                let sources = collect_base_tables_in_query(&ctx, &query, &cte_defs)?;
+                let srcs: Vec<String> = sources
                     .iter()
                     .map(|t| format!("{}.{}", t.db, t.table))
                     .collect();
-                srcs.sort();
                 out.push(TableStmtInfo {
                     stmt_type: "CREATE_VIEW".to_string(),
                     start_line: span.start.line as u32,
@@ -563,111 +722,26 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
                     let (db, table) = qualify_table(&ctx, name)?;
                     let target_table = TableKey { db, table };
 
-                    let select = expect_simple_select(q)?;
                     let cte_defs = build_cte_defs(&ctx, q)?;
-                    let (alias_map, cte_aliases, derived_aliases) =
-                        build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                    let default_only_table = only_table_in_from(&alias_map);
-                    let default_only_cte = only_cte_in_from(&cte_aliases, &alias_map);
-                    let default_only_derived =
-                        only_derived_in_from(&derived_aliases, &alias_map, &cte_aliases);
-
-                    let expanded = expand_select_items(
-                        select,
-                        &ctx,
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &cte_defs,
-                    )?;
-                    let target_cols: Vec<String> =
-                        expanded.iter().map(|e| e.out_name.clone()).collect();
-                    let named_windows = build_named_window_map(select);
-                    for (i, exp) in expanded.iter().enumerate() {
-                        let (mut sources, mut has_any_col) =
-                            collect_sources_from_select_item_with_cte(
-                                &exp.item,
-                                default_only_table.as_ref(),
-                                default_only_cte.as_ref(),
-                                default_only_derived.as_ref(),
-                                &alias_map,
-                                &cte_aliases,
-                                &derived_aliases,
-                                &cte_defs,
-                                Some(&named_windows),
-                            )?;
-                        union_group_having(
-                            select,
-                            default_only_table.as_ref(),
-                            default_only_cte.as_ref(),
-                            default_only_derived.as_ref(),
-                            &alias_map,
-                            &cte_aliases,
-                            &derived_aliases,
-                            &cte_defs,
-                            Some(&named_windows),
-                            &mut sources,
+                    let info = analyze_query_info(&ctx, q, &cte_defs)?;
+                    let target_cols: Vec<String> = if !columns.is_empty() {
+                        columns.iter().map(|c| ident_to_string(&c.name)).collect()
+                    } else {
+                        info.columns.clone()
+                    };
+                    if target_cols.len() != info.columns.len() {
+                        bail!(
+                            "Target columns count ({}) does not match SELECT projection ({}) for table {}.{}",
+                            target_cols.len(),
+                            info.columns.len(),
+                            target_table.db,
+                            target_table.table
                         );
-                        if !exp.is_from_wildcard && sources.is_empty() {
-                            if let Some(single_tbl) = default_only_table.as_ref() {
-                                let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                                    &exp.item,
-                                    &cte_aliases,
-                                    &derived_aliases,
-                                    &cte_defs,
-                                )?;
-                                sources.insert(ColumnRef {
-                                    table: (*single_tbl).clone(),
-                                    column: expr_sql,
-                                });
-                                has_any_col = true;
-                            } else {
-                                let mut allow_fallback =
-                                    matches!(exp.item, SelectItem::UnnamedExpr(_));
-                                if let SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) =
-                                    &exp.item
-                                {
-                                    if idents.len() == 2 {
-                                        let qual = ident_to_string(&idents[0]);
-                                        let col = ident_to_string(&idents[1]);
-                                        if let Some(info) = derived_aliases.get(&qual) {
-                                            if info.exprs.contains_key(&col) {
-                                                allow_fallback = false;
-                                            }
-                                        }
-                                        if let Some(cte_name) = cte_aliases.get(&qual) {
-                                            if let Some(info) = cte_defs.defs.get(cte_name) {
-                                                if info.exprs.contains_key(&col) {
-                                                    allow_fallback = false;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if allow_fallback {
-                                    let base_tables = collect_base_tables_in_scope(
-                                        &alias_map,
-                                        &cte_aliases,
-                                        &derived_aliases,
-                                        &cte_defs,
-                                    );
-                                    if !base_tables.is_empty() {
-                                        sources = base_tables
-                                            .into_iter()
-                                            .map(|t| ColumnRef {
-                                                table: t,
-                                                column: "*".to_string(),
-                                            })
-                                            .collect();
-                                        has_any_col = true;
-                                    }
-                                }
-                            }
-                        }
-                        if has_any_col {
-                            let mut srcs: Vec<String> =
-                                sources.iter().map(|c| c.to_string()).collect();
-                            srcs.sort();
+                    }
+                    for (i, col_name) in target_cols.iter().enumerate().take(info.columns.len()) {
+                        if let Some(Some(srcs)) = info.sources_by_index.get(i) {
+                            let srcs_vec: Vec<String> =
+                                srcs.iter().map(|c| c.to_string()).collect();
                             out.push(ColumnLineageInfo {
                                 stmt_index: idx,
                                 stmt_type: "CTAS".to_string(),
@@ -676,18 +750,12 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
                                 end_line: span.end.line as u32,
                                 end_col: span.end.column as u32,
                                 target: format!("{}.{}", target_table.db, target_table.table),
-                                column: target_cols[i].clone(),
-                                sources: Some(srcs),
+                                column: col_name.clone(),
+                                sources: Some(srcs_vec),
                                 expr: None,
                                 statement: extract_snippet(sql, span),
                             });
-                        } else {
-                            let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                                &exp.item,
-                                &cte_aliases,
-                                &derived_aliases,
-                                &cte_defs,
-                            )?;
+                        } else if let Some(Some(expr)) = info.exprs_by_index.get(i) {
                             out.push(ColumnLineageInfo {
                                 stmt_index: idx,
                                 stmt_type: "CTAS".to_string(),
@@ -696,9 +764,9 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
                                 end_line: span.end.line as u32,
                                 end_col: span.end.column as u32,
                                 target: format!("{}.{}", target_table.db, target_table.table),
-                                column: target_cols[i].clone(),
+                                column: col_name.clone(),
                                 sources: None,
-                                expr: Some(expr_sql),
+                                expr: Some(expr.clone()),
                                 statement: extract_snippet(sql, span),
                             });
                         }
@@ -712,120 +780,29 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
                 };
                 let target_table = TableKey { db, table };
                 if let Some(source_q) = ins.source.as_ref() {
-                    let select = expect_simple_select(source_q)?;
                     let cte_defs = build_cte_defs(&ctx, source_q)?;
-                    let (alias_map, cte_aliases, derived_aliases) =
-                        build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                    let default_only_table = only_table_in_from(&alias_map);
-                    let default_only_cte = only_cte_in_from(&cte_aliases, &alias_map);
-                    let default_only_derived =
-                        only_derived_in_from(&derived_aliases, &alias_map, &cte_aliases);
-                    let expanded = expand_select_items(
-                        select,
-                        &ctx,
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &cte_defs,
-                    )?;
-                    // target columns list similar于 analyze_sql_lineage，优先显式列，否则 schema，否则用 expanded 名
+                    let info = analyze_query_info(&ctx, source_q, &cte_defs)?;
+                    // target columns list similar于 analyze_sql_lineage
                     let target_cols: Vec<String> = if !ins.columns.is_empty() {
                         ins.columns.iter().map(ident_to_string).collect()
                     } else if let Some(cols) = ctx.schemas.get(&target_table) {
                         cols.clone()
                     } else {
-                        expanded.iter().map(|e| e.out_name.clone()).collect()
+                        info.columns.clone()
                     };
-                    let named_windows = build_named_window_map(select);
-                    for (i, exp) in expanded.iter().enumerate() {
-                        let (mut sources, mut has_any_col) =
-                            collect_sources_from_select_item_with_cte(
-                                &exp.item,
-                                default_only_table.as_ref(),
-                                default_only_cte.as_ref(),
-                                default_only_derived.as_ref(),
-                                &alias_map,
-                                &cte_aliases,
-                                &derived_aliases,
-                                &cte_defs,
-                                Some(&named_windows),
-                            )?;
-                        union_group_having(
-                            select,
-                            default_only_table.as_ref(),
-                            default_only_cte.as_ref(),
-                            default_only_derived.as_ref(),
-                            &alias_map,
-                            &cte_aliases,
-                            &derived_aliases,
-                            &cte_defs,
-                            Some(&named_windows),
-                            &mut sources,
+                    if target_cols.len() != info.columns.len() {
+                        bail!(
+                            "Target columns count ({}) does not match SELECT projection ({}) for table {}.{}",
+                            target_cols.len(),
+                            info.columns.len(),
+                            target_table.db,
+                            target_table.table
                         );
-                        if !exp.is_from_wildcard && sources.is_empty() {
-                            if let Some(single_tbl) = default_only_table.as_ref() {
-                                let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                                    &exp.item,
-                                    &cte_aliases,
-                                    &derived_aliases,
-                                    &cte_defs,
-                                )?;
-                                sources.insert(ColumnRef {
-                                    table: (*single_tbl).clone(),
-                                    column: expr_sql,
-                                });
-                                has_any_col = true;
-                            } else {
-                                let mut allow_fallback =
-                                    matches!(exp.item, SelectItem::UnnamedExpr(_));
-                                if let SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) =
-                                    &exp.item
-                                {
-                                    if idents.len() == 2 {
-                                        let qual = ident_to_string(&idents[0]);
-                                        let col = ident_to_string(&idents[1]);
-                                        if let Some(info) = derived_aliases.get(&qual) {
-                                            if info.exprs.contains_key(&col) {
-                                                allow_fallback = false;
-                                            }
-                                        }
-                                        if let Some(cte_name) = cte_aliases.get(&qual) {
-                                            if let Some(info) = cte_defs.defs.get(cte_name) {
-                                                if info.exprs.contains_key(&col) {
-                                                    allow_fallback = false;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if allow_fallback {
-                                    let base_tables = collect_base_tables_in_scope(
-                                        &alias_map,
-                                        &cte_aliases,
-                                        &derived_aliases,
-                                        &cte_defs,
-                                    );
-                                    if !base_tables.is_empty() {
-                                        sources = base_tables
-                                            .into_iter()
-                                            .map(|t| ColumnRef {
-                                                table: t,
-                                                column: "*".to_string(),
-                                            })
-                                            .collect();
-                                        has_any_col = true;
-                                    }
-                                }
-                            }
-                        }
-                        let col_name = target_cols
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_else(|| exp.out_name.clone());
-                        if has_any_col {
-                            let mut srcs: Vec<String> =
-                                sources.iter().map(|c| c.to_string()).collect();
-                            srcs.sort();
+                    }
+                    for (i, col_name) in target_cols.iter().enumerate().take(info.columns.len()) {
+                        if let Some(Some(srcs)) = info.sources_by_index.get(i) {
+                            let srcs_vec: Vec<String> =
+                                srcs.iter().map(|c| c.to_string()).collect();
                             out.push(ColumnLineageInfo {
                                 stmt_index: idx,
                                 stmt_type: "INSERT".to_string(),
@@ -834,18 +811,12 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
                                 end_line: span.end.line as u32,
                                 end_col: span.end.column as u32,
                                 target: format!("{}.{}", target_table.db, target_table.table),
-                                column: col_name,
-                                sources: Some(srcs),
+                                column: col_name.clone(),
+                                sources: Some(srcs_vec),
                                 expr: None,
                                 statement: extract_snippet(sql, span),
                             });
-                        } else {
-                            let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                                &exp.item,
-                                &cte_aliases,
-                                &derived_aliases,
-                                &cte_defs,
-                            )?;
+                        } else if let Some(Some(expr)) = info.exprs_by_index.get(i) {
                             out.push(ColumnLineageInfo {
                                 stmt_index: idx,
                                 stmt_type: "INSERT".to_string(),
@@ -854,9 +825,9 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
                                 end_line: span.end.line as u32,
                                 end_col: span.end.column as u32,
                                 target: format!("{}.{}", target_table.db, target_table.table),
-                                column: col_name,
+                                column: col_name.clone(),
                                 sources: None,
-                                expr: Some(expr_sql),
+                                expr: Some(expr.clone()),
                                 statement: extract_snippet(sql, span),
                             });
                         }
@@ -871,99 +842,25 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
             } => {
                 let (db, table) = qualify_table(&ctx, &name)?;
                 let target_table = TableKey { db, table };
-                let select = expect_simple_select(&query)?;
                 let cte_defs = build_cte_defs(&ctx, &query)?;
-                let (alias_map, cte_aliases, derived_aliases) =
-                    build_alias_map_with_cte(&ctx, &select.from, &cte_defs)?;
-                let default_only_table = only_table_in_from(&alias_map);
-                let default_only_cte = only_cte_in_from(&cte_aliases, &alias_map);
-                let default_only_derived =
-                    only_derived_in_from(&derived_aliases, &alias_map, &cte_aliases);
-                let expanded = expand_select_items(
-                    select,
-                    &ctx,
-                    &alias_map,
-                    &cte_aliases,
-                    &derived_aliases,
-                    &cte_defs,
-                )?;
+                let info = analyze_query_info(&ctx, &query, &cte_defs)?;
                 let target_cols: Vec<String> = if !columns.is_empty() {
                     columns.iter().map(|c| ident_to_string(&c.name)).collect()
                 } else {
-                    expanded.iter().map(|e| e.out_name.clone()).collect()
+                    info.columns.clone()
                 };
-                let named_windows = build_named_window_map(select);
-                for (i, exp) in expanded.iter().enumerate() {
-                    let (mut sources, mut has_any_col) = collect_sources_from_select_item_with_cte(
-                        &exp.item,
-                        default_only_table.as_ref(),
-                        default_only_cte.as_ref(),
-                        default_only_derived.as_ref(),
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &cte_defs,
-                        Some(&named_windows),
-                    )?;
-                    union_group_having(
-                        select,
-                        default_only_table.as_ref(),
-                        default_only_cte.as_ref(),
-                        default_only_derived.as_ref(),
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &cte_defs,
-                        Some(&named_windows),
-                        &mut sources,
-                    );
-                    if !exp.is_from_wildcard && sources.is_empty() {
-                        let mut allow_fallback = matches!(exp.item, SelectItem::UnnamedExpr(_));
-                        if let SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) = &exp.item
-                        {
-                            if idents.len() == 2 {
-                                let qual = ident_to_string(&idents[0]);
-                                let col = ident_to_string(&idents[1]);
-                                if let Some(info) = derived_aliases.get(&qual) {
-                                    if info.exprs.contains_key(&col) {
-                                        allow_fallback = false;
-                                    }
-                                }
-                                if let Some(cte_name) = cte_aliases.get(&qual) {
-                                    if let Some(info) = cte_defs.defs.get(cte_name) {
-                                        if info.exprs.contains_key(&col) {
-                                            allow_fallback = false;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if allow_fallback {
-                            let base_tables = collect_base_tables_in_scope(
-                                &alias_map,
-                                &cte_aliases,
-                                &derived_aliases,
-                                &cte_defs,
-                            );
-                            if !base_tables.is_empty() {
-                                sources = base_tables
-                                    .into_iter()
-                                    .map(|t| ColumnRef {
-                                        table: t,
-                                        column: "*".to_string(),
-                                    })
-                                    .collect();
-                                has_any_col = true;
-                            }
-                        }
-                    }
-                    let col_name = target_cols
-                        .get(i)
-                        .cloned()
-                        .unwrap_or_else(|| exp.out_name.clone());
-                    if has_any_col {
-                        let mut srcs: Vec<String> = sources.iter().map(|c| c.to_string()).collect();
-                        srcs.sort();
+                if target_cols.len() != info.columns.len() {
+                    bail!(
+                    "Target columns count ({}) does not match SELECT projection ({}) for view {}.{}",
+                    target_cols.len(),
+                    info.columns.len(),
+                    target_table.db,
+                    target_table.table
+                );
+                }
+                for (i, col_name) in target_cols.iter().enumerate().take(info.columns.len()) {
+                    if let Some(Some(srcs)) = info.sources_by_index.get(i) {
+                        let srcs_vec: Vec<String> = srcs.iter().map(|c| c.to_string()).collect();
                         out.push(ColumnLineageInfo {
                             stmt_index: idx,
                             stmt_type: "CREATE_VIEW".to_string(),
@@ -972,18 +869,12 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
                             end_line: span.end.line as u32,
                             end_col: span.end.column as u32,
                             target: format!("{}.{}", target_table.db, target_table.table),
-                            column: col_name,
-                            sources: Some(srcs),
+                            column: col_name.clone(),
+                            sources: Some(srcs_vec),
                             expr: None,
                             statement: extract_snippet(sql, span),
                         });
-                    } else {
-                        let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                            &exp.item,
-                            &cte_aliases,
-                            &derived_aliases,
-                            &cte_defs,
-                        )?;
+                    } else if let Some(Some(expr)) = info.exprs_by_index.get(i) {
                         out.push(ColumnLineageInfo {
                             stmt_index: idx,
                             stmt_type: "CREATE_VIEW".to_string(),
@@ -992,9 +883,9 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
                             end_line: span.end.line as u32,
                             end_col: span.end.column as u32,
                             target: format!("{}.{}", target_table.db, target_table.table),
-                            column: col_name,
+                            column: col_name.clone(),
                             sources: None,
-                            expr: Some(expr_sql),
+                            expr: Some(expr.clone()),
                             statement: extract_snippet(sql, span),
                         });
                     }
@@ -1020,12 +911,11 @@ fn qualify_table(ctx: &Context, name: &ObjectName) -> Result<(String, String)> {
     let parts: Vec<String> = object_name_parts(name)?;
     match parts.len() {
         1 => {
-            let db = ctx.current_db.clone().ok_or_else(|| {
-                anyhow!(
-                    "Unqualified table name '{}' without active database (USE) context",
-                    parts[0]
-                )
-            })?;
+            // Default to "default" database when not set via USE
+            let db = ctx
+                .current_db
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
             Ok((db, parts[0].clone()))
         }
         2 => Ok((parts[0].clone(), parts[1].clone())),
@@ -1048,19 +938,120 @@ fn object_name_parts(name: &ObjectName) -> Result<Vec<String>> {
     Ok(parts)
 }
 
-fn expect_simple_select(query: &Query) -> Result<&Select> {
-    match query.body.as_ref() {
-        SetExpr::Select(select) => Ok(select),
-        other => bail!(
-            "Only simple SELECT is supported in this analyzer, got {}",
-            other
-        ),
+// (removed) expect_simple_select: previously used before set operation support
+
+// Analyze a full Query (not just a simple Select), supporting set operations
+fn analyze_query_info(ctx: &Context, query: &Query, cte_defs: &CteDefs) -> Result<DerivedInfo> {
+    analyze_setexpr_info(ctx, query.body.as_ref(), cte_defs)
+}
+
+fn analyze_setexpr_info(ctx: &Context, body: &SetExpr, cte_defs: &CteDefs) -> Result<DerivedInfo> {
+    match body {
+        SetExpr::Select(select) => analyze_select_info(ctx, select, cte_defs),
+        SetExpr::Query(inner) => analyze_setexpr_info(ctx, inner.body.as_ref(), cte_defs),
+        SetExpr::SetOperation { left, right, .. } => {
+            let left_info = analyze_setexpr_info(ctx, left.as_ref(), cte_defs)?;
+            let right_info = analyze_setexpr_info(ctx, right.as_ref(), cte_defs)?;
+            merge_derived_info_for_set(left_info, right_info)
+        }
+        other => bail!("Unsupported query in lineage analysis: {}", other),
+    }
+}
+
+// Merge two DerivedInfo results coming from a set operation (e.g., UNION/INTERSECT/EXCEPT)
+// Column names are taken from the left side (SQL semantics), and per-index sources are
+// combined (union). If neither side has concrete sources for a column, keep the left expr
+// (or right if left missing).
+fn merge_derived_info_for_set(left: DerivedInfo, right: DerivedInfo) -> Result<DerivedInfo> {
+    if left.columns.len() != right.columns.len() {
+        bail!(
+            "Set operation branches have different column counts: {} vs {}",
+            left.columns.len(),
+            right.columns.len()
+        );
+    }
+
+    let col_len = left.columns.len();
+    let mut out = DerivedInfo {
+        columns: left.columns.clone(),
+        sources: HashMap::with_capacity(col_len),
+        exprs: HashMap::with_capacity(col_len),
+        sources_by_index: vec![None; col_len],
+        exprs_by_index: vec![None; col_len],
+    };
+    for i in 0..col_len {
+        let mut merged: BTreeSet<ColumnRef> = BTreeSet::new();
+        if let Some(Some(ls)) = left.sources_by_index.get(i) {
+            merged.extend(ls.iter().cloned());
+        }
+        if let Some(Some(rs)) = right.sources_by_index.get(i) {
+            merged.extend(rs.iter().cloned());
+        }
+        let col_name = out.columns[i].clone();
+        if !merged.is_empty() {
+            let rc_merged = Rc::new(merged);
+            out.sources_by_index[i] = Some(rc_merged.clone());
+            out.exprs_by_index[i] = None;
+            out.sources.insert(col_name, rc_merged);
+        } else {
+            let expr = left
+                .exprs_by_index
+                .get(i)
+                .and_then(|e| e.clone())
+                .or_else(|| right.exprs_by_index.get(i).and_then(|e| e.clone()))
+                .unwrap_or_else(|| "".to_string());
+            if !expr.is_empty() {
+                out.exprs_by_index[i] = Some(expr.clone());
+                out.sources_by_index[i] = None;
+                out.exprs.insert(col_name, expr);
+            }
+        }
+    }
+    Ok(out)
+}
+
+// Collect base tables used by a Query (including set operations)
+fn collect_base_tables_in_query(
+    ctx: &Context,
+    query: &Query,
+    cte_defs: &CteDefs,
+) -> Result<BTreeSet<TableKey>> {
+    collect_base_tables_in_setexpr(ctx, query.body.as_ref(), cte_defs)
+}
+
+fn collect_base_tables_in_setexpr(
+    ctx: &Context,
+    body: &SetExpr,
+    cte_defs: &CteDefs,
+) -> Result<BTreeSet<TableKey>> {
+    match body {
+        SetExpr::Select(select) => {
+            let (alias_map, cte_aliases, derived_aliases) =
+                build_alias_map_with_cte(ctx, &select.from, cte_defs)?;
+            Ok(collect_base_tables_in_scope(
+                &alias_map,
+                &cte_aliases,
+                &derived_aliases,
+                cte_defs,
+            ))
+        }
+        SetExpr::Query(inner) => collect_base_tables_in_setexpr(ctx, inner.body.as_ref(), cte_defs),
+        SetExpr::SetOperation { left, right, .. } => {
+            let mut set = collect_base_tables_in_setexpr(ctx, left.as_ref(), cte_defs)?;
+            let right_set = collect_base_tables_in_setexpr(ctx, right.as_ref(), cte_defs)?;
+            for t in right_set {
+                set.insert(t);
+            }
+            Ok(set)
+        }
+        other => bail!("Unsupported query for table lineage: {}", other),
     }
 }
 
 fn list_sources_in_order(from: &[TableWithJoins], cte_defs: &CteDefs) -> Vec<(String, SourceKind)> {
     // Return a vec of (qualifier, SourceKind) in FROM order
-    let mut v = Vec::new();
+    let est = from.iter().map(|twj| 1 + twj.joins.len()).sum();
+    let mut v = Vec::with_capacity(est);
     for twj in from {
         collect_source_entry(&twj.relation, cte_defs, &mut v);
         for j in &twj.joins {
@@ -1121,7 +1112,7 @@ fn expand_select_items(
     derived_aliases: &HashMap<String, DerivedInfo>,
     cte_defs: &CteDefs,
 ) -> Result<Vec<ExpandedItem>> {
-    let mut out: Vec<ExpandedItem> = Vec::new();
+    let mut out: Vec<ExpandedItem> = Vec::with_capacity(select.projection.len());
     let sources_in_order = list_sources_in_order(&select.from, cte_defs);
 
     for item in &select.projection {
@@ -1272,55 +1263,8 @@ fn expand_select_items(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn union_group_having(
-    select: &Select,
-    default_only_table: Option<&TableKey>,
-    default_only_cte: Option<&String>,
-    default_only_derived: Option<&String>,
-    alias_map: &HashMap<String, TableKey>,
-    cte_aliases: &HashMap<String, String>,
-    derived_aliases: &HashMap<String, DerivedInfo>,
-    cte_defs: &CteDefs,
-    named_windows: Option<&HashMap<String, ast::WindowSpec>>,
-    acc: &mut BTreeSet<ColumnRef>,
-) {
-    // GROUP BY
-    match &select.group_by {
-        ast::GroupByExpr::Expressions(exprs, _) => {
-            for e in exprs {
-                collect_columns_from_expr_with_cte(
-                    e,
-                    default_only_table,
-                    default_only_cte,
-                    default_only_derived,
-                    alias_map,
-                    cte_aliases,
-                    derived_aliases,
-                    cte_defs,
-                    acc,
-                    named_windows,
-                );
-            }
-        }
-        ast::GroupByExpr::All(_) => {}
-    }
-    // HAVING
-    if let Some(having) = &select.having {
-        collect_columns_from_expr_with_cte(
-            having,
-            default_only_table,
-            default_only_cte,
-            default_only_derived,
-            alias_map,
-            cte_aliases,
-            derived_aliases,
-            cte_defs,
-            acc,
-            named_windows,
-        );
-    }
-}
+// deprecated: replaced by compute_group_having_cols(select, rctx)
+// fn union_group_having(select: &Select, rctx: &ResolveCtx, acc: &mut BTreeSet<ColumnRef>) { }
 
 fn build_named_window_map(select: &Select) -> HashMap<String, ast::WindowSpec> {
     use ast::{NamedWindowDefinition, NamedWindowExpr};
@@ -1368,7 +1312,7 @@ fn collect_base_tables_in_scope(
     for cte_name in cte_aliases.values() {
         if let Some(info) = cte_defs.defs.get(cte_name) {
             for srcs in info.sources.values() {
-                for s in srcs {
+                for s in srcs.iter() {
                     set.insert(s.table.clone());
                 }
             }
@@ -1376,7 +1320,7 @@ fn collect_base_tables_in_scope(
     }
     for info in derived_aliases.values() {
         for srcs in info.sources.values() {
-            for s in srcs {
+            for s in srcs.iter() {
                 set.insert(s.table.clone());
             }
         }
@@ -1389,9 +1333,18 @@ fn collect_base_tables_in_scope(
 fn analyze_select_info(ctx: &Context, select: &Select, cte_defs: &CteDefs) -> Result<DerivedInfo> {
     let (alias_map, cte_aliases, derived_aliases) =
         build_alias_map_with_cte(ctx, &select.from, cte_defs)?;
-    let default_only_table = only_table_in_from(&alias_map);
+    let default_only_table = if cte_aliases.is_empty() && derived_aliases.is_empty() {
+        only_table_in_from(&alias_map)
+    } else {
+        None
+    };
     let default_only_cte = only_cte_in_from(&cte_aliases, &alias_map);
     let default_only_derived = only_derived_in_from(&derived_aliases, &alias_map, &cte_aliases);
+    let default_only = pick_default_only(
+        default_only_table.as_ref(),
+        default_only_cte.as_ref(),
+        default_only_derived.as_ref(),
+    );
 
     let expanded = expand_select_items(
         select,
@@ -1404,104 +1357,47 @@ fn analyze_select_info(ctx: &Context, select: &Select, cte_defs: &CteDefs) -> Re
     let cols: Vec<String> = expanded.iter().map(|e| e.out_name.clone()).collect();
     let mut info = DerivedInfo {
         columns: cols.clone(),
-        sources: HashMap::new(),
-        exprs: HashMap::new(),
+        sources: HashMap::with_capacity(cols.len()),
+        exprs: HashMap::with_capacity(cols.len()),
         sources_by_index: vec![None; cols.len()],
         exprs_by_index: vec![None; cols.len()],
     };
     let named_windows = build_named_window_map(select);
 
+    let rctx = make_resolve_ctx(
+        &alias_map,
+        &cte_aliases,
+        &derived_aliases,
+        cte_defs,
+        Some(&named_windows),
+        default_only,
+    );
+    // group/having ignored for lineage; no need to compute
+    let base_tables_pre = compute_base_tables_in_scope(&rctx);
     for (i, exp) in expanded.iter().enumerate() {
-        let (mut sources, mut has_any_col) = collect_sources_from_select_item_with_cte(
-            &exp.item,
-            default_only_table.as_ref(),
-            default_only_cte.as_ref(),
-            default_only_derived.as_ref(),
-            &alias_map,
-            &cte_aliases,
-            &derived_aliases,
-            cte_defs,
-            Some(&named_windows),
-        )?;
-        union_group_having(
-            select,
-            default_only_table.as_ref(),
-            default_only_cte.as_ref(),
-            default_only_derived.as_ref(),
-            &alias_map,
-            &cte_aliases,
-            &derived_aliases,
-            cte_defs,
-            Some(&named_windows),
-            &mut sources,
-        );
+        let (mut sources, mut has_any_col) =
+            collect_sources_from_select_item_with_cte(&exp.item, &rctx)?;
+        // ignore group by / having for lineage mapping
 
-        if !exp.is_from_wildcard && sources.is_empty() {
-            if let Some(single_tbl) = default_only_table.as_ref() {
-                let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                    &exp.item,
-                    &cte_aliases,
-                    &derived_aliases,
-                    cte_defs,
-                )?;
-                sources.insert(ColumnRef {
-                    table: (*single_tbl).clone(),
-                    column: expr_sql,
-                });
-                has_any_col = true;
-            } else {
-                let mut allow_fallback = matches!(exp.item, SelectItem::UnnamedExpr(_));
-                if let SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) = &exp.item {
-                    if idents.len() == 2 {
-                        let qual = ident_to_string(&idents[0]);
-                        let col = ident_to_string(&idents[1]);
-                        if let Some(info_d) = derived_aliases.get(&qual) {
-                            if info_d.exprs.contains_key(&col) {
-                                allow_fallback = false;
-                            }
-                        }
-                        if let Some(cte_name) = cte_aliases.get(&qual) {
-                            if let Some(info_c) = cte_defs.defs.get(cte_name) {
-                                if info_c.exprs.contains_key(&col) {
-                                    allow_fallback = false;
-                                }
-                            }
-                        }
-                    }
-                }
-                if allow_fallback {
-                    let base_tables = collect_base_tables_in_scope(
-                        &alias_map,
-                        &cte_aliases,
-                        &derived_aliases,
-                        cte_defs,
-                    );
-                    if !base_tables.is_empty() {
-                        sources = base_tables
-                            .into_iter()
-                            .map(|t| ColumnRef {
-                                table: t,
-                                column: "*".to_string(),
-                            })
-                            .collect();
-                        has_any_col = true;
-                    }
-                }
-            }
+        if maybe_fill_sources_for_empty(
+            &exp.item,
+            exp.is_from_wildcard,
+            &rctx,
+            &mut sources,
+            true,
+            Some(&base_tables_pre),
+        )? {
+            has_any_col = true;
         }
 
         let col_name = info.columns[i].clone();
         if has_any_col {
-            info.sources.insert(col_name, sources.clone());
-            info.sources_by_index[i] = Some(sources);
+            let rc_sources = Rc::new(sources);
+            info.sources.insert(col_name, rc_sources.clone());
+            info.sources_by_index[i] = Some(rc_sources);
             info.exprs_by_index[i] = None;
         } else {
-            let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                &exp.item,
-                &cte_aliases,
-                &derived_aliases,
-                cte_defs,
-            )?;
+            let expr_sql = select_item_expr_sql_with_ctx(&exp.item, &rctx)?;
             info.exprs.insert(col_name, expr_sql.clone());
             info.exprs_by_index[i] = Some(expr_sql);
             info.sources_by_index[i] = None;
@@ -1511,20 +1407,23 @@ fn analyze_select_info(ctx: &Context, select: &Select, cte_defs: &CteDefs) -> Re
     Ok(info)
 }
 
+// Simple alias to keep signatures tidy
+type AliasMaps = (
+    HashMap<String, TableKey>,
+    HashMap<String, String>,
+    HashMap<String, DerivedInfo>,
+);
+
 // Build alias map for physical tables and record CTE aliases used in FROM/JOIN
-#[allow(clippy::type_complexity)]
 fn build_alias_map_with_cte(
     ctx: &Context,
     from: &[TableWithJoins],
     cte_defs: &CteDefs,
-) -> Result<(
-    HashMap<String, TableKey>,
-    HashMap<String, String>,
-    HashMap<String, DerivedInfo>,
-)> {
-    let mut map: HashMap<String, TableKey> = HashMap::new();
-    let mut cte_aliases: HashMap<String, String> = HashMap::new();
-    let mut derived_aliases: HashMap<String, DerivedInfo> = HashMap::new();
+) -> Result<AliasMaps> {
+    let est = from.iter().map(|twj| 1 + twj.joins.len()).sum();
+    let mut map: HashMap<String, TableKey> = HashMap::with_capacity(est);
+    let mut cte_aliases: HashMap<String, String> = HashMap::with_capacity(est);
+    let mut derived_aliases: HashMap<String, DerivedInfo> = HashMap::with_capacity(est);
 
     for twj in from {
         collect_from_factor_with_cte(
@@ -1607,9 +1506,8 @@ fn build_cte_defs(ctx: &Context, query: &Query) -> Result<CteDefs> {
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let cte_name = ident_to_string(&cte.alias.name);
-            let select = expect_simple_select(&cte.query)?;
-
-            // column names
+            let derived = analyze_query_info(ctx, &cte.query, &defs)?;
+            // column names: explicit list if provided; else from derived info
             let col_names: Vec<String> = if !cte.alias.columns.is_empty() {
                 cte.alias
                     .columns
@@ -1617,93 +1515,19 @@ fn build_cte_defs(ctx: &Context, query: &Query) -> Result<CteDefs> {
                     .map(|c| ident_to_string(&c.name))
                     .collect()
             } else {
-                select
-                    .projection
-                    .iter()
-                    .map(select_item_output_name)
-                    .collect::<Result<Vec<_>>>()?
+                derived.columns.clone()
             };
 
-            // alias map for CTE's FROM including earlier CTEs
-            let (alias_map, cte_aliases, derived_aliases) =
-                build_alias_map_with_cte(ctx, &select.from, &defs)?;
-            let default_only_table = only_table_in_from(&alias_map);
-            let default_only_cte = only_cte_in_from(&cte_aliases, &alias_map);
-            let default_only_derived =
-                only_derived_in_from(&derived_aliases, &alias_map, &cte_aliases);
-
-            let expanded = expand_select_items(
-                select,
-                ctx,
-                &alias_map,
-                &cte_aliases,
-                &derived_aliases,
-                &defs,
-            )?;
             let mut info = CteInfo {
                 columns: col_names.clone(),
-                sources: HashMap::new(),
-                exprs: HashMap::new(),
+                sources: HashMap::with_capacity(col_names.len()),
+                exprs: HashMap::with_capacity(col_names.len()),
             };
-            let named_windows = build_named_window_map(select);
-            for (i, exp) in expanded.iter().enumerate() {
-                let (mut srcs, mut has_any) = collect_sources_from_select_item_with_cte(
-                    &exp.item,
-                    default_only_table.as_ref(),
-                    default_only_cte.as_ref(),
-                    default_only_derived.as_ref(),
-                    &alias_map,
-                    &cte_aliases,
-                    &derived_aliases,
-                    &defs,
-                    Some(&named_windows),
-                )?;
-                if !exp.is_from_wildcard && srcs.is_empty() {
-                    if let Some(single_tbl) = default_only_table.as_ref() {
-                        let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                            &exp.item,
-                            &cte_aliases,
-                            &derived_aliases,
-                            &defs,
-                        )?;
-                        srcs.insert(ColumnRef {
-                            table: (*single_tbl).clone(),
-                            column: expr_sql,
-                        });
-                        has_any = true;
-                    } else if matches!(exp.item, SelectItem::UnnamedExpr(_)) {
-                        let base_tables = collect_base_tables_in_scope(
-                            &alias_map,
-                            &cte_aliases,
-                            &derived_aliases,
-                            &defs,
-                        );
-                        if !base_tables.is_empty() {
-                            srcs = base_tables
-                                .into_iter()
-                                .map(|t| ColumnRef {
-                                    table: t,
-                                    column: "*".to_string(),
-                                })
-                                .collect();
-                            has_any = true;
-                        }
-                    }
-                }
-                let name = col_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("col_{}", i + 1));
-                if has_any {
-                    info.sources.insert(name, srcs);
-                } else {
-                    let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                        &exp.item,
-                        &cte_aliases,
-                        &derived_aliases,
-                        &defs,
-                    )?;
-                    info.exprs.insert(name, expr_sql);
+            for (i, name) in col_names.into_iter().enumerate() {
+                if let Some(Some(srcs)) = derived.sources_by_index.get(i) {
+                    info.sources.insert(name, srcs.clone());
+                } else if let Some(Some(expr)) = derived.exprs_by_index.get(i) {
+                    info.exprs.insert(name, expr.clone());
                 }
             }
             defs.defs.insert(cte_name, info);
@@ -1782,139 +1606,42 @@ fn build_derived_info(
     cte_defs: &CteDefs,
     alias: Option<&TableAlias>,
 ) -> Result<DerivedInfo> {
-    let select = expect_simple_select(subquery)?;
-    let (alias_map, cte_aliases, derived_aliases) =
-        build_alias_map_with_cte(ctx, &select.from, cte_defs)?;
-    let default_only_table = only_table_in_from(&alias_map);
-    let default_only_cte = only_cte_in_from(&cte_aliases, &alias_map);
-    let default_only_derived = only_derived_in_from(&derived_aliases, &alias_map, &cte_aliases);
-
-    let col_names: Vec<String> = if let Some(alias) = alias {
+    // Build info with base-fallback enabled so bare identifiers in multi-table
+    // derived queries map to each base table's same-named column.
+    let mut info = analyze_query_info(ctx, subquery, cte_defs)?;
+    // Apply alias column names if provided
+    if let Some(alias) = alias {
         if !alias.columns.is_empty() {
-            alias
+            let new_cols: Vec<String> = alias
                 .columns
                 .iter()
                 .map(|c| ident_to_string(&c.name))
-                .collect()
-        } else {
-            select
-                .projection
-                .iter()
-                .map(select_item_output_name)
-                .collect::<Result<Vec<_>>>()?
-        }
-    } else {
-        select
-            .projection
-            .iter()
-            .map(select_item_output_name)
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    let expanded = expand_select_items(
-        select,
-        ctx,
-        &alias_map,
-        &cte_aliases,
-        &derived_aliases,
-        cte_defs,
-    )?;
-    let mut info = DerivedInfo {
-        columns: col_names.clone(),
-        sources: HashMap::new(),
-        exprs: HashMap::new(),
-        sources_by_index: vec![None; col_names.len()],
-        exprs_by_index: vec![None; col_names.len()],
-    };
-    let named_windows = build_named_window_map(select);
-    for (i, exp) in expanded.iter().enumerate() {
-        let (mut srcs, mut has_any) = collect_sources_from_select_item_with_cte(
-            &exp.item,
-            default_only_table.as_ref(),
-            default_only_cte.as_ref(),
-            default_only_derived.as_ref(),
-            &alias_map,
-            &cte_aliases,
-            &derived_aliases,
-            cte_defs,
-            Some(&named_windows),
-        )?;
-        union_group_having(
-            select,
-            default_only_table.as_ref(),
-            default_only_cte.as_ref(),
-            default_only_derived.as_ref(),
-            &alias_map,
-            &cte_aliases,
-            &derived_aliases,
-            cte_defs,
-            Some(&named_windows),
-            &mut srcs,
-        );
-        if !exp.is_from_wildcard && srcs.is_empty() {
-            if let Some(single_tbl) = default_only_table.as_ref() {
-                let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                    &exp.item,
-                    &cte_aliases,
-                    &derived_aliases,
-                    cte_defs,
-                )?;
-                srcs.insert(ColumnRef {
-                    table: (*single_tbl).clone(),
-                    column: expr_sql,
-                });
-                has_any = true;
+                .collect();
+            let mut renamed = DerivedInfo {
+                columns: new_cols.clone(),
+                sources: HashMap::with_capacity(new_cols.len()),
+                exprs: HashMap::with_capacity(new_cols.len()),
+                sources_by_index: vec![None; new_cols.len()],
+                exprs_by_index: vec![None; new_cols.len()],
+            };
+            for (i, name) in new_cols.into_iter().enumerate() {
+                if let Some(Some(srcs)) = info.sources_by_index.get(i) {
+                    renamed.sources_by_index[i] = Some(srcs.clone());
+                    renamed.sources.insert(name, srcs.clone());
+                } else if let Some(Some(expr)) = info.exprs_by_index.get(i) {
+                    renamed.exprs_by_index[i] = Some(expr.clone());
+                    renamed.exprs.insert(name, expr.clone());
+                }
             }
-        }
-        let name = col_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("col_{}", i + 1));
-        if has_any {
-            info.sources_by_index[i] = Some(srcs.clone());
-            info.exprs_by_index[i] = None;
-            info.sources.insert(name, srcs);
-        } else {
-            let expr_sql = select_item_expr_sql_with_cte_and_derived(
-                &exp.item,
-                &cte_aliases,
-                &derived_aliases,
-                cte_defs,
-            )?;
-            info.exprs_by_index[i] = Some(expr_sql.clone());
-            info.sources_by_index[i] = None;
-            info.exprs.insert(name, expr_sql);
+            info = renamed;
         }
     }
     Ok(info)
 }
 
-fn select_item_output_name(item: &SelectItem) -> Result<String> {
-    match item {
-        SelectItem::ExprWithAlias { alias, .. } => Ok(ident_to_string(alias)),
-        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => Ok(ident_to_string(ident)),
-        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => idents
-            .last()
-            .map(ident_to_string)
-            .ok_or_else(|| anyhow!("Invalid compound identifier")),
-        SelectItem::UnnamedExpr(expr) => Ok(expr.to_string()),
-        SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
-            bail!("Wildcard in projection not supported for lineage output names")
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn collect_sources_from_select_item_with_cte(
     item: &SelectItem,
-    default_only_table: Option<&TableKey>,
-    default_only_cte: Option<&String>,
-    default_only_derived: Option<&String>,
-    alias_map: &HashMap<String, TableKey>,
-    cte_aliases: &HashMap<String, String>,
-    derived_aliases: &HashMap<String, DerivedInfo>,
-    cte_defs: &CteDefs,
-    named_windows: Option<&HashMap<String, ast::WindowSpec>>,
+    rctx: &ResolveCtx,
 ) -> Result<(BTreeSet<ColumnRef>, bool)> {
     let expr = match item {
         SelectItem::ExprWithAlias { expr, .. } => expr,
@@ -1922,80 +1649,64 @@ fn collect_sources_from_select_item_with_cte(
         other => bail!("Unsupported select item in lineage analysis: {}", other),
     };
     let mut set: BTreeSet<ColumnRef> = BTreeSet::new();
-    collect_columns_from_expr_with_cte(
-        expr,
-        default_only_table,
-        default_only_cte,
-        default_only_derived,
-        alias_map,
-        cte_aliases,
-        derived_aliases,
-        cte_defs,
-        &mut set,
-        named_windows,
-    );
+    collect_columns_from_expr_with_cte(expr, rctx, &mut set);
     let has_any = !set.is_empty();
     Ok((set, has_any))
 }
 
-#[allow(clippy::too_many_arguments, clippy::collapsible_match)]
 fn collect_columns_from_expr_with_cte(
     expr: &Expr,
-    default_only_table: Option<&TableKey>,
-    default_only_cte: Option<&String>,
-    default_only_derived: Option<&String>,
-    alias_map: &HashMap<String, TableKey>,
-    cte_aliases: &HashMap<String, String>,
-    derived_aliases: &HashMap<String, DerivedInfo>,
-    cte_defs: &CteDefs,
+    rctx: &ResolveCtx,
     acc: &mut BTreeSet<ColumnRef>,
-    named_windows: Option<&HashMap<String, ast::WindowSpec>>,
 ) {
     match expr {
-        Expr::Identifier(ident) => {
-            if let Some(tbl) = default_only_table {
+        Expr::Identifier(ident) => match rctx.default_only {
+            Some(DefaultOnly::Table(tbl)) => {
                 acc.insert(ColumnRef {
                     table: tbl.clone(),
                     column: ident_to_string(ident),
                 });
-            } else if let Some(cte_name) = default_only_cte {
-                if let Some(info) = cte_defs.defs.get(cte_name) {
+            }
+            Some(DefaultOnly::Cte(cte_name)) => {
+                if let Some(info) = rctx.cte_defs.defs.get(cte_name) {
                     if let Some(srcs) = info.sources.get(&ident_to_string(ident)) {
-                        for s in srcs {
-                            acc.insert(s.clone());
-                        }
-                    }
-                }
-            } else if let Some(derived_name) = default_only_derived {
-                if let Some(info) = derived_aliases.get(derived_name) {
-                    if let Some(srcs) = info.sources.get(&ident_to_string(ident)) {
-                        for s in srcs {
+                        for s in srcs.iter() {
                             acc.insert(s.clone());
                         }
                     }
                 }
             }
-        }
+            Some(DefaultOnly::Derived(derived_name)) => {
+                if let Some(info) = rctx.derived_aliases.get(derived_name) {
+                    if let Some(srcs) = info.sources.get(&ident_to_string(ident)) {
+                        for s in srcs.iter() {
+                            acc.insert(s.clone());
+                        }
+                    }
+                }
+            }
+            None => {}
+        },
         Expr::CompoundIdentifier(idents) => {
             if idents.len() == 2 {
                 let qualifier = ident_to_string(&idents[0]);
                 let col = ident_to_string(&idents[1]);
-                if let Some(tbl) = alias_map.get(&qualifier) {
+                if let Some(tbl) = rctx.alias_map.get(&qualifier) {
                     acc.insert(ColumnRef {
                         table: tbl.clone(),
                         column: col,
                     });
-                } else if let Some(cte_name) = cte_aliases.get(&qualifier) {
-                    if let Some(info) = cte_defs.defs.get(cte_name) {
+                } else if let Some(cte_name) = rctx.cte_aliases.get(&qualifier) {
+                    if let Some(info) = rctx.cte_defs.defs.get(cte_name) {
                         if let Some(srcs) = info.sources.get(&col) {
-                            for s in srcs {
+                            for s in srcs.iter() {
                                 acc.insert(s.clone());
                             }
                         }
                     }
-                } else if let Some(info) = derived_aliases.get(&qualifier) {
+                } else if let Some(info) = rctx.derived_aliases.get(&qualifier) {
                     if let Some(srcs) = info.sources.get(&col) {
-                        for s in srcs {
+                        for s in srcs.iter() {
                             acc.insert(s.clone());
                         }
                     }
@@ -2003,55 +1714,11 @@ fn collect_columns_from_expr_with_cte(
             }
         }
         Expr::BinaryOp { left, right, .. } => {
-            collect_columns_from_expr_with_cte(
-                left,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
-            collect_columns_from_expr_with_cte(
-                right,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
+            collect_columns_from_expr_with_cte(left, rctx, acc);
+            collect_columns_from_expr_with_cte(right, rctx, acc);
         }
-        Expr::UnaryOp { expr, .. } => collect_columns_from_expr_with_cte(
-            expr,
-            default_only_table,
-            default_only_cte,
-            default_only_derived,
-            alias_map,
-            cte_aliases,
-            derived_aliases,
-            cte_defs,
-            acc,
-            named_windows,
-        ),
-        Expr::Nested(e) => collect_columns_from_expr_with_cte(
-            e,
-            default_only_table,
-            default_only_cte,
-            default_only_derived,
-            alias_map,
-            cte_aliases,
-            derived_aliases,
-            cte_defs,
-            acc,
-            named_windows,
-        ),
+        Expr::UnaryOp { expr, .. } => collect_columns_from_expr_with_cte(expr, rctx, acc),
+        Expr::Nested(e) => collect_columns_from_expr_with_cte(e, rctx, acc),
         Expr::Function(fun) => {
             match &fun.args {
                 ast::FunctionArguments::None => {}
@@ -2060,34 +1727,12 @@ fn collect_columns_from_expr_with_cte(
                     for arg in &list.args {
                         match arg {
                             ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                                collect_columns_from_expr_with_cte(
-                                    e,
-                                    default_only_table,
-                                    default_only_cte,
-                                    default_only_derived,
-                                    alias_map,
-                                    cte_aliases,
-                                    derived_aliases,
-                                    cte_defs,
-                                    acc,
-                                    named_windows,
-                                )
+                                collect_columns_from_expr_with_cte(e, rctx, acc)
                             }
                             ast::FunctionArg::Named { arg, .. }
                             | ast::FunctionArg::ExprNamed { arg, .. } => {
                                 if let ast::FunctionArgExpr::Expr(e) = arg {
-                                    collect_columns_from_expr_with_cte(
-                                        e,
-                                        default_only_table,
-                                        default_only_cte,
-                                        default_only_derived,
-                                        alias_map,
-                                        cte_aliases,
-                                        derived_aliases,
-                                        cte_defs,
-                                        acc,
-                                        named_windows,
-                                    )
+                                    collect_columns_from_expr_with_cte(e, rctx, acc)
                                 }
                             }
                             ast::FunctionArg::Unnamed(ast::FunctionArgExpr::QualifiedWildcard(
@@ -2101,160 +1746,54 @@ fn collect_columns_from_expr_with_cte(
                 }
             }
             if let Some(f) = &fun.filter {
-                collect_columns_from_expr_with_cte(
-                    f,
-                    default_only_table,
-                    default_only_cte,
-                    default_only_derived,
-                    alias_map,
-                    cte_aliases,
-                    derived_aliases,
-                    cte_defs,
-                    acc,
-                    named_windows,
-                );
+                collect_columns_from_expr_with_cte(f, rctx, acc);
             }
             if let Some(over) = &fun.over {
                 match over {
                     ast::WindowType::WindowSpec(spec) => {
                         for e in &spec.partition_by {
-                            collect_columns_from_expr_with_cte(
-                                e,
-                                default_only_table,
-                                default_only_cte,
-                                default_only_derived,
-                                alias_map,
-                                cte_aliases,
-                                derived_aliases,
-                                cte_defs,
-                                acc,
-                                named_windows,
-                            );
+                            collect_columns_from_expr_with_cte(e, rctx, acc);
                         }
                         for ob in &spec.order_by {
-                            collect_columns_from_expr_with_cte(
-                                &ob.expr,
-                                default_only_table,
-                                default_only_cte,
-                                default_only_derived,
-                                alias_map,
-                                cte_aliases,
-                                derived_aliases,
-                                cte_defs,
-                                acc,
-                                named_windows,
-                            );
+                            collect_columns_from_expr_with_cte(&ob.expr, rctx, acc);
                         }
                         if let Some(frame) = &spec.window_frame {
-                            match &frame.start_bound {
-                                ast::WindowFrameBound::Preceding(Some(n))
-                                | ast::WindowFrameBound::Following(Some(n)) => {
-                                    collect_columns_from_expr_with_cte(
-                                        n,
-                                        default_only_table,
-                                        default_only_cte,
-                                        default_only_derived,
-                                        alias_map,
-                                        cte_aliases,
-                                        derived_aliases,
-                                        cte_defs,
-                                        acc,
-                                        named_windows,
-                                    )
-                                }
-                                _ => {}
+                            if let ast::WindowFrameBound::Preceding(Some(n))
+                            | ast::WindowFrameBound::Following(Some(n)) = &frame.start_bound
+                            {
+                                collect_columns_from_expr_with_cte(n, rctx, acc)
                             }
-                            if let Some(endb) = &frame.end_bound {
-                                match endb {
-                                    ast::WindowFrameBound::Preceding(Some(n))
-                                    | ast::WindowFrameBound::Following(Some(n)) => {
-                                        collect_columns_from_expr_with_cte(
-                                            n,
-                                            default_only_table,
-                                            default_only_cte,
-                                            default_only_derived,
-                                            alias_map,
-                                            cte_aliases,
-                                            derived_aliases,
-                                            cte_defs,
-                                            acc,
-                                            named_windows,
-                                        )
-                                    }
-                                    _ => {}
-                                }
+                            if let Some(
+                                ast::WindowFrameBound::Preceding(Some(n))
+                                | ast::WindowFrameBound::Following(Some(n)),
+                            ) = &frame.end_bound
+                            {
+                                collect_columns_from_expr_with_cte(n, rctx, acc)
                             }
                         }
                     }
                     ast::WindowType::NamedWindow(id) => {
-                        if let Some(map) = named_windows {
+                        if let Some(map) = rctx.named_windows {
                             if let Some(spec) = map.get(&id.value) {
                                 for e in &spec.partition_by {
-                                    collect_columns_from_expr_with_cte(
-                                        e,
-                                        default_only_table,
-                                        default_only_cte,
-                                        default_only_derived,
-                                        alias_map,
-                                        cte_aliases,
-                                        derived_aliases,
-                                        cte_defs,
-                                        acc,
-                                        named_windows,
-                                    );
+                                    collect_columns_from_expr_with_cte(e, rctx, acc);
                                 }
                                 for ob in &spec.order_by {
-                                    collect_columns_from_expr_with_cte(
-                                        &ob.expr,
-                                        default_only_table,
-                                        default_only_cte,
-                                        default_only_derived,
-                                        alias_map,
-                                        cte_aliases,
-                                        derived_aliases,
-                                        cte_defs,
-                                        acc,
-                                        named_windows,
-                                    );
+                                    collect_columns_from_expr_with_cte(&ob.expr, rctx, acc);
                                 }
                                 if let Some(frame) = &spec.window_frame {
-                                    match &frame.start_bound {
-                                        ast::WindowFrameBound::Preceding(Some(n))
-                                        | ast::WindowFrameBound::Following(Some(n)) => {
-                                            collect_columns_from_expr_with_cte(
-                                                n,
-                                                default_only_table,
-                                                default_only_cte,
-                                                default_only_derived,
-                                                alias_map,
-                                                cte_aliases,
-                                                derived_aliases,
-                                                cte_defs,
-                                                acc,
-                                                named_windows,
-                                            )
-                                        }
-                                        _ => {}
+                                    if let ast::WindowFrameBound::Preceding(Some(n))
+                                    | ast::WindowFrameBound::Following(Some(n)) =
+                                        &frame.start_bound
+                                    {
+                                        collect_columns_from_expr_with_cte(n, rctx, acc)
                                     }
-                                    if let Some(endb) = &frame.end_bound {
-                                        match endb {
-                                            ast::WindowFrameBound::Preceding(Some(n))
-                                            | ast::WindowFrameBound::Following(Some(n)) => {
-                                                collect_columns_from_expr_with_cte(
-                                                    n,
-                                                    default_only_table,
-                                                    default_only_cte,
-                                                    default_only_derived,
-                                                    alias_map,
-                                                    cte_aliases,
-                                                    derived_aliases,
-                                                    cte_defs,
-                                                    acc,
-                                                    named_windows,
-                                                )
-                                            }
-                                            _ => {}
-                                        }
+                                    if let Some(
+                                        ast::WindowFrameBound::Preceding(Some(n))
+                                        | ast::WindowFrameBound::Following(Some(n)),
+                                    ) = &frame.end_bound
+                                    {
+                                        collect_columns_from_expr_with_cte(n, rctx, acc)
                                     }
                                 }
                             }
@@ -2263,32 +1802,10 @@ fn collect_columns_from_expr_with_cte(
                 }
             }
             for ob in &fun.within_group {
-                collect_columns_from_expr_with_cte(
-                    &ob.expr,
-                    default_only_table,
-                    default_only_cte,
-                    default_only_derived,
-                    alias_map,
-                    cte_aliases,
-                    derived_aliases,
-                    cte_defs,
-                    acc,
-                    named_windows,
-                );
+                collect_columns_from_expr_with_cte(&ob.expr, rctx, acc);
             }
         }
-        Expr::Cast { expr, .. } => collect_columns_from_expr_with_cte(
-            expr,
-            default_only_table,
-            default_only_cte,
-            default_only_derived,
-            alias_map,
-            cte_aliases,
-            derived_aliases,
-            cte_defs,
-            acc,
-            named_windows,
-        ),
+        Expr::Cast { expr, .. } => collect_columns_from_expr_with_cte(expr, rctx, acc),
         Expr::Case {
             operand,
             conditions,
@@ -2296,227 +1813,51 @@ fn collect_columns_from_expr_with_cte(
             ..
         } => {
             if let Some(op) = operand {
-                collect_columns_from_expr_with_cte(
-                    op,
-                    default_only_table,
-                    default_only_cte,
-                    default_only_derived,
-                    alias_map,
-                    cte_aliases,
-                    derived_aliases,
-                    cte_defs,
-                    acc,
-                    named_windows,
-                );
+                collect_columns_from_expr_with_cte(op, rctx, acc);
             }
             for c in conditions {
-                collect_columns_from_expr_with_cte(
-                    &c.condition,
-                    default_only_table,
-                    default_only_cte,
-                    default_only_derived,
-                    alias_map,
-                    cte_aliases,
-                    derived_aliases,
-                    cte_defs,
-                    acc,
-                    named_windows,
-                );
-                collect_columns_from_expr_with_cte(
-                    &c.result,
-                    default_only_table,
-                    default_only_cte,
-                    default_only_derived,
-                    alias_map,
-                    cte_aliases,
-                    derived_aliases,
-                    cte_defs,
-                    acc,
-                    named_windows,
-                );
+                collect_columns_from_expr_with_cte(&c.condition, rctx, acc);
+                collect_columns_from_expr_with_cte(&c.result, rctx, acc);
             }
             if let Some(e) = else_result {
-                collect_columns_from_expr_with_cte(
-                    e,
-                    default_only_table,
-                    default_only_cte,
-                    default_only_derived,
-                    alias_map,
-                    cte_aliases,
-                    derived_aliases,
-                    cte_defs,
-                    acc,
-                    named_windows,
-                );
+                collect_columns_from_expr_with_cte(e, rctx, acc);
             }
         }
         Expr::Like { expr, pattern, .. } => {
-            collect_columns_from_expr_with_cte(
-                expr,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
-            collect_columns_from_expr_with_cte(
-                pattern,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
+            collect_columns_from_expr_with_cte(expr, rctx, acc);
+            collect_columns_from_expr_with_cte(pattern, rctx, acc);
         }
         Expr::ILike { expr, pattern, .. } => {
-            collect_columns_from_expr_with_cte(
-                expr,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
-            collect_columns_from_expr_with_cte(
-                pattern,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
+            collect_columns_from_expr_with_cte(expr, rctx, acc);
+            collect_columns_from_expr_with_cte(pattern, rctx, acc);
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            collect_columns_from_expr_with_cte(
-                expr,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
-            collect_columns_from_expr_with_cte(
-                low,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
-            collect_columns_from_expr_with_cte(
-                high,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
+            collect_columns_from_expr_with_cte(expr, rctx, acc);
+            collect_columns_from_expr_with_cte(low, rctx, acc);
+            collect_columns_from_expr_with_cte(high, rctx, acc);
         }
         Expr::InList { expr, list, .. } => {
-            collect_columns_from_expr_with_cte(
-                expr,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
+            collect_columns_from_expr_with_cte(expr, rctx, acc);
             for e in list {
-                collect_columns_from_expr_with_cte(
-                    e,
-                    default_only_table,
-                    default_only_cte,
-                    default_only_derived,
-                    alias_map,
-                    cte_aliases,
-                    derived_aliases,
-                    cte_defs,
-                    acc,
-                    named_windows,
-                );
+                collect_columns_from_expr_with_cte(e, rctx, acc);
             }
         }
         Expr::InSubquery { expr, .. } => {
-            collect_columns_from_expr_with_cte(
-                expr,
-                default_only_table,
-                default_only_cte,
-                default_only_derived,
-                alias_map,
-                cte_aliases,
-                derived_aliases,
-                cte_defs,
-                acc,
-                named_windows,
-            );
+            collect_columns_from_expr_with_cte(expr, rctx, acc);
         }
         Expr::GroupingSets(sets) => {
             for group in sets {
                 for e in group {
-                    collect_columns_from_expr_with_cte(
-                        e,
-                        default_only_table,
-                        default_only_cte,
-                        default_only_derived,
-                        alias_map,
-                        cte_aliases,
-                        derived_aliases,
-                        cte_defs,
-                        acc,
-                        named_windows,
-                    );
+                    collect_columns_from_expr_with_cte(e, rctx, acc);
                 }
             }
         }
         Expr::Cube(sets) | Expr::Rollup(sets) => {
             for group in sets {
                 for e in group {
-                    collect_columns_from_expr_with_cte(
-                        e,
-                        default_only_table,
-                        default_only_cte,
-                        default_only_derived,
-                        alias_map,
-                        cte_aliases,
-                        derived_aliases,
-                        cte_defs,
-                        acc,
-                        named_windows,
-                    );
+                    collect_columns_from_expr_with_cte(e, rctx, acc);
                 }
             }
         }
@@ -2553,6 +1894,15 @@ fn select_item_expr_sql_with_cte_and_derived(
         },
         other => Ok(other.to_string()),
     }
+}
+
+fn select_item_expr_sql_with_ctx(item: &SelectItem, rctx: &ResolveCtx) -> Result<String> {
+    select_item_expr_sql_with_cte_and_derived(
+        item,
+        rctx.cte_aliases,
+        rctx.derived_aliases,
+        rctx.cte_defs,
+    )
 }
 
 fn use_to_db(u: &Use) -> Result<Option<String>> {
@@ -3036,6 +2386,184 @@ mod tests {
         "#;
         let lines = analyze_sql_lineage(sql)?;
         let expected = vec!["dbn.tgt.id <- dbn.s.id".to_string()];
+        assert_eq!(sorted(lines), sorted(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_with_union_all() -> Result<()> {
+        let sql = r#"
+            USE d;
+            CREATE TABLE sals (id INT, n STRING);
+            CREATE TABLE ducks (i INT, j STRING);
+            CREATE TABLE tae (id INT, name STRING);
+            INSERT OVERWRITE TABLE tae
+            SELECT id, n AS name FROM sals
+            UNION ALL
+            SELECT i, j FROM ducks;
+        "#;
+        let lines = analyze_sql_lineage(sql)?;
+        let expected = vec![
+            "d.tae.id <- d.ducks.i, d.sals.id".to_string(),
+            "d.tae.name <- d.ducks.j, d.sals.n".to_string(),
+        ];
+        assert_eq!(sorted(lines), sorted(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_with_union() -> Result<()> {
+        let sql = r#"
+            USE d2;
+            CREATE TABLE sals (id INT, n STRING);
+            CREATE TABLE ducks (i INT, j STRING);
+            CREATE TABLE tae (id INT, name STRING);
+            INSERT INTO tae
+            SELECT id, n AS name FROM sals
+            UNION
+            SELECT i, j FROM ducks;
+        "#;
+        let lines = analyze_sql_lineage(sql)?;
+        let expected = vec![
+            "d2.tae.id <- d2.ducks.i, d2.sals.id".to_string(),
+            "d2.tae.name <- d2.ducks.j, d2.sals.n".to_string(),
+        ];
+        assert_eq!(sorted(lines), sorted(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_with_intersect() -> Result<()> {
+        let sql = r#"
+            USE d3;
+            CREATE TABLE sals (id INT, n STRING);
+            CREATE TABLE ducks (i INT, j STRING);
+            CREATE TABLE tae (id INT, name STRING);
+            INSERT INTO tae
+            SELECT id, n AS name FROM sals
+            INTERSECT
+            SELECT i, j FROM ducks;
+        "#;
+        let lines = analyze_sql_lineage(sql)?;
+        let expected = vec![
+            "d3.tae.id <- d3.ducks.i, d3.sals.id".to_string(),
+            "d3.tae.name <- d3.ducks.j, d3.sals.n".to_string(),
+        ];
+        assert_eq!(sorted(lines), sorted(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_with_except() -> Result<()> {
+        let sql = r#"
+            USE d4;
+            CREATE TABLE sals (id INT, n STRING);
+            CREATE TABLE ducks (i INT, j STRING);
+            CREATE TABLE tae (id INT, name STRING);
+            INSERT INTO tae
+            SELECT id, n AS name FROM sals
+            EXCEPT
+            SELECT i, j FROM ducks;
+        "#;
+        let lines = analyze_sql_lineage(sql)?;
+        let expected = vec![
+            "d4.tae.id <- d4.ducks.i, d4.sals.id".to_string(),
+            "d4.tae.name <- d4.ducks.j, d4.sals.n".to_string(),
+        ];
+        assert_eq!(sorted(lines), sorted(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn test_tables_lineage_set_ops() -> Result<()> {
+        let sql = r#"
+            USE dtb;
+            CREATE TABLE s (id INT, n STRING);
+            CREATE TABLE d (i INT, j STRING);
+            CREATE TABLE t AS SELECT id, n FROM s UNION SELECT i, j FROM d;
+            INSERT INTO t SELECT id, n FROM s EXCEPT SELECT i, j FROM d;
+        "#;
+        let lines = analyze_sql_tables(sql)?;
+        let expected = vec![
+            "dtb.t <- dtb.d, dtb.s".to_string(),
+            "dtb.t <- dtb.d, dtb.s".to_string(),
+        ];
+        assert_eq!(sorted(lines), sorted(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lineage_detailed_with_intersect() -> Result<()> {
+        let sql = r#"
+            USE dj;
+            CREATE TABLE sals (id INT, n STRING);
+            CREATE TABLE ducks (i INT, j STRING);
+            CREATE TABLE tae (id INT, name STRING);
+            INSERT INTO tae
+            SELECT id, n AS name FROM sals
+            INTERSECT
+            SELECT i, j FROM ducks;
+        "#;
+        let infos = analyze_sql_lineage_detailed(sql)?;
+        let items: Vec<_> = infos
+            .iter()
+            .filter(|e| e.stmt_type == "INSERT" && e.target == "dj.tae")
+            .collect();
+        assert_eq!(items.len(), 2);
+        let id = items.iter().find(|e| e.column == "id").unwrap();
+        let name = items.iter().find(|e| e.column == "name").unwrap();
+        let sid = id.sources.as_ref().unwrap();
+        assert!(sid.iter().any(|s| s == "dj.sals.id"));
+        assert!(sid.iter().any(|s| s == "dj.ducks.i"));
+        let sname = name.sources.as_ref().unwrap();
+        assert!(sname.iter().any(|s| s == "dj.sals.n"));
+        assert!(sname.iter().any(|s| s == "dj.ducks.j"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lineage_detailed_with_except() -> Result<()> {
+        let sql = r#"
+            USE dk;
+            CREATE TABLE sals (id INT, n STRING);
+            CREATE TABLE ducks (i INT, j STRING);
+            CREATE TABLE tae (id INT, name STRING);
+            INSERT INTO tae
+            SELECT id, n AS name FROM sals
+            EXCEPT
+            SELECT i, j FROM ducks;
+        "#;
+        let infos = analyze_sql_lineage_detailed(sql)?;
+        let items: Vec<_> = infos
+            .iter()
+            .filter(|e| e.stmt_type == "INSERT" && e.target == "dk.tae")
+            .collect();
+        assert_eq!(items.len(), 2);
+        let id = items.iter().find(|e| e.column == "id").unwrap();
+        let name = items.iter().find(|e| e.column == "name").unwrap();
+        let sid = id.sources.as_ref().unwrap();
+        assert!(sid.iter().any(|s| s == "dk.sals.id"));
+        assert!(sid.iter().any(|s| s == "dk.ducks.i"));
+        let sname = name.sources.as_ref().unwrap();
+        assert!(sname.iter().any(|s| s == "dk.sals.n"));
+        assert!(sname.iter().any(|s| s == "dk.ducks.j"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_bare_identifier_multi_tables_fallback_as_columns() -> Result<()> {
+        let sql = r#"
+            USE xa;
+            CREATE TABLE sals (id INT, n STRING);
+            CREATE TABLE ducks (id INT, n STRING);
+            CREATE TABLE tae (id INT, name STRING);
+            INSERT OVERWRITE TABLE tae SELECT id, n AS name FROM sals JOIN ducks;
+        "#;
+        let lines = analyze_sql_lineage(sql)?;
+        let expected = vec![
+            "xa.tae.id <- xa.ducks.id, xa.sals.id".to_string(),
+            "xa.tae.name <- xa.ducks.n, xa.sals.n".to_string(),
+        ];
         assert_eq!(sorted(lines), sorted(expected));
         Ok(())
     }

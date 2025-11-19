@@ -56,6 +56,12 @@ fn main() -> anyhow::Result<()> {
 - 格式与静态检查：`cargo fmt`、`cargo clippy`
 - 依赖：`sqlparser = =0.59.0`（固定版本，升级请谨慎评估兼容性）
 
+## 默认数据库（schema）
+- 若 SQL 中未通过 `USE db;` 指定当前数据库，则未带库名的表引用默认使用 `default` 库。
+- 例如：
+  - 输入：`INSERT OVERWRITE TABLE sdl.tae SELECT id, n AS name FROM sals;`
+  - 解析：源表 `sals` 被解析为 `default.sals`。
+
 ## 贡献
 请查看 `AGENTS.md` 获取项目结构、编码规范、测试与提交流程等贡献指南。
 
