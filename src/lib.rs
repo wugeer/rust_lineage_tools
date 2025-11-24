@@ -14,6 +14,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::rc::Rc;
 
+// Diesel schema and models
+pub mod models;
+pub mod schema;
+
+// HTTP service modules
+pub mod config;
+pub mod db;
+pub mod handlers;
+pub mod server;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 struct TableKey {
     db: String,
@@ -1391,7 +1401,8 @@ fn analyze_select_info(ctx: &Context, select: &Select, cte_defs: &CteDefs) -> Re
 
         if has_any_col {
             let rc_sources = Rc::new(sources);
-            info.sources.insert(info.columns[i].clone(), rc_sources.clone());
+            info.sources
+                .insert(info.columns[i].clone(), rc_sources.clone());
             info.sources_by_index[i] = Some(rc_sources);
             info.exprs_by_index[i] = None;
         } else {

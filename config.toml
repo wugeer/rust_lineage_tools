@@ -1,0 +1,14 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+# Number of worker threads for the async runtime
+worker_threads = 4
+
+[database]
+host = "localhost"
+port = 5432
+dbname = "lineage"
+user = "postgres"
+password = "postgres"
+# Maximum number of connections in the pool
+pool_size = 16
