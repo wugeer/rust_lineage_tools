@@ -430,4 +430,4 @@ CREATE TABLE t AS SELECT -1 AS m, CAST(1 AS INT) AS c FROM s;
 
 ## 许可证
 
-本项目采用 MIT 许可证。
+本项目采用 Apache-2.0 license 许可证。
