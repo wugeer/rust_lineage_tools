@@ -21,9 +21,12 @@ chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 dotenv = "0.15"
 flate2 = "1"
+pq-sys = { version = "0.7", features = ["bundled"] }
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
 
 [profile.release]
 debug = true
+strip = "none"

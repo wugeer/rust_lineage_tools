@@ -287,6 +287,31 @@ cargo clippy
 cargo build --release
 ```
 
+## 构建静态跨平台二进制包
+
+`pq-sys` 依赖启用了 `bundled` 特性，会在构建时自动编译嵌入的 `libpq`，配合 `musl` 目标即可生成无需额外依赖的完全静态 Linux 可执行文件。
+
+```bash
+# 安装需要的交叉编译目标（在 Linux 上示例）
+rustup target add x86_64-unknown-linux-musl
+
+# 生成默认的静态 Linux 产物（会放在 dist/ 目录）
+scripts/build-dist.sh
+
+# 指定多个目标（在对应平台执行，或提前配置好交叉编译工具链）
+TARGETS="x86_64-unknown-linux-musl x86_64-pc-windows-gnu" scripts/build-dist.sh
+```
+
+脚本会在 `dist/` 目录下生成形如 `hive_lineage-v0.1.0-x86_64-unknown-linux-musl.tar.gz` 的压缩包，每个压缩包包含：
+- 对应平台的可执行文件（Linux 为静态 `musl`，Windows 为 `.exe`，macOS 建议在 macOS 上运行脚本生成）
+- `README.md` 与 `config.example.toml`
+
+**重要提示**
+- 不需要额外编写 `.cargo/config` 去强制 `musl-gcc` 或 `-static` 链接。Rust 自带的 `x86_64-unknown-linux-musl` 目标默认输出“static-pie”可执行文件（包含 musl loader），在 CentOS 7 / Alpine 等旧系统上运行不会触发 `_start_c` 处的段错误。
+- 如果之前为了解决依赖问题添加过 `-C link-arg=-static` 等全局覆盖，请移除；否则可执行文件可能在早期启动阶段崩溃。
+
+可以通过 `ldd dist/.../hive_lineage` 验证 Linux 产物为 “not a dynamic executable”，以确认静态链接生效。若需要构建其他体系架构，请确保安装了相应的 `rustup target` 以及系统级交叉编译工具链（例如 `musl-gcc`、`x86_64-w64-mingw32-gcc` 等）。
+
 **依赖说明：**
 - `sqlparser = =0.59.0` - SQL 解析器（固定版本，升级请谨慎评估兼容性）
 - `actix-web = "4"` - HTTP 服务框架
