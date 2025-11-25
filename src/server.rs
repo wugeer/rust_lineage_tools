@@ -8,7 +8,7 @@ use crate::handlers::{analyze_field_lineage, analyze_table_lineage, health_check
 pub async fn start_server(host: &str, port: u16, workers: usize, pool: DbPool) -> io::Result<()> {
     let bind_addr = format!("{}:{}", host, port);
 
-    log::info!("Starting server on {} with {} workers", bind_addr, workers);
+    tracing::info!("Starting server on {} with {} workers", bind_addr, workers);
 
     HttpServer::new(move || {
         App::new()

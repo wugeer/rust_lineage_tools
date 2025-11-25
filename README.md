@@ -37,6 +37,32 @@ dbname = "lineage"
 user = "postgres"
 password = "postgres"
 pool_size = 16
+
+[logging]
+log_dir = "./logs"        # 日志文件目录
+log_level = "info"        # 日志级别: trace, debug, info, warn, error
+max_log_files = 7         # 保留的日志文件数量（按天）
+```
+
+**日志配置说明：**
+
+- **日志轮转**：每天自动创建新的日志文件，文件名格式为 `hive_lineage.log.YYYY-MM-DD`
+- **自动压缩**：服务启动时自动将非当天的日志文件压缩为 `.log.gz` 格式，节省磁盘空间
+- **自动清理**：服务启动时自动删除超过 `max_log_files` 天数的旧日志文件（包括压缩文件）
+- **日志输出**：同时输出到控制台（stdout）和日志文件
+- **日志级别**：支持 `trace`、`debug`、`info`、`warn`、`error` 五个级别
+- **环境变量**：可通过 `RUST_LOG` 环境变量覆盖配置文件中的日志级别
+
+示例：
+```bash
+# 使用 debug 级别启动服务
+RUST_LOG=debug ./target/release/hive_lineage
+
+# 查看当天日志文件（未压缩）
+tail -f ./logs/hive_lineage.log.*
+
+# 查看历史压缩日志
+zcat ./logs/hive_lineage.log.2025-11-24.gz | less
 ```
 
 **数据库设置：**

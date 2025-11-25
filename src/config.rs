@@ -6,6 +6,8 @@ use std::path::Path;
 pub struct AppConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
+    #[serde(default)]
+    pub logging: LogConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -25,6 +27,38 @@ pub struct DatabaseConfig {
     pub password: String,
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LogConfig {
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    #[serde(default = "default_max_log_files")]
+    pub max_log_files: usize,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            log_dir: default_log_dir(),
+            log_level: default_log_level(),
+            max_log_files: default_max_log_files(),
+        }
+    }
+}
+
+fn default_log_dir() -> String {
+    "./logs".to_string()
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_max_log_files() -> usize {
+    7
 }
 
 fn default_pool_size() -> usize {

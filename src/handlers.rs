@@ -37,7 +37,7 @@ pub async fn analyze_table_lineage(
     pool: web::Data<DbPool>,
     req: web::Json<LineageRequest>,
 ) -> impl Responder {
-    log::info!(
+    tracing::info!(
         "Analyzing table lineage for dag_id={}, task_id={}",
         req.dag_id,
         req.task_id
@@ -47,7 +47,7 @@ pub async fn analyze_table_lineage(
     let stmt_infos = match crate::analyze_sql_tables_detailed(&req.sql) {
         Ok(infos) => infos,
         Err(e) => {
-            log::error!("SQL analysis failed: {}", e);
+            tracing::error!("SQL analysis failed: {}", e);
             return HttpResponse::BadRequest().json(ErrorResponse {
                 error: format!("SQL analysis failed: {}", e),
             });
@@ -65,7 +65,7 @@ pub async fn analyze_table_lineage(
         let mut conn = match pool.get() {
             Ok(conn) => conn,
             Err(e) => {
-                log::error!("Failed to get database connection: {}", e);
+                tracing::error!("Failed to get database connection: {}", e);
                 return HttpResponse::InternalServerError().json(ErrorResponse {
                     error: "Database connection error".to_string(),
                 });
@@ -75,7 +75,7 @@ pub async fn analyze_table_lineage(
         if let Err(e) =
             crate::db::insert_table_lineage(&mut conn, &req.dag_id, &req.task_id, &target, &sources)
         {
-            log::error!("Failed to insert table lineage: {}", e);
+            tracing::error!("Failed to insert table lineage: {}", e);
             return HttpResponse::InternalServerError().json(ErrorResponse {
                 error: "Failed to save lineage data".to_string(),
             });
@@ -92,7 +92,7 @@ pub async fn analyze_field_lineage(
     pool: web::Data<DbPool>,
     req: web::Json<LineageRequest>,
 ) -> impl Responder {
-    log::info!(
+    tracing::info!(
         "Analyzing field lineage for dag_id={}, task_id={}",
         req.dag_id,
         req.task_id
@@ -102,7 +102,7 @@ pub async fn analyze_field_lineage(
     let col_infos = match crate::analyze_sql_lineage_detailed(&req.sql) {
         Ok(infos) => infos,
         Err(e) => {
-            log::error!("SQL analysis failed: {}", e);
+            tracing::error!("SQL analysis failed: {}", e);
             return HttpResponse::BadRequest().json(ErrorResponse {
                 error: format!("SQL analysis failed: {}", e),
             });
@@ -133,7 +133,7 @@ pub async fn analyze_field_lineage(
         let mut conn = match pool.get() {
             Ok(conn) => conn,
             Err(e) => {
-                log::error!("Failed to get database connection: {}", e);
+                tracing::error!("Failed to get database connection: {}", e);
                 return HttpResponse::InternalServerError().json(ErrorResponse {
                     error: "Database connection error".to_string(),
                 });
@@ -148,7 +148,7 @@ pub async fn analyze_field_lineage(
             &target_field,
             &source_fields,
         ) {
-            log::error!("Failed to insert field lineage: {}", e);
+            tracing::error!("Failed to insert field lineage: {}", e);
             return HttpResponse::InternalServerError().json(ErrorResponse {
                 error: "Failed to save lineage data".to_string(),
             });
