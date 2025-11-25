@@ -288,17 +288,6 @@ fn compute_base_tables_in_scope(rctx: &ResolveCtx) -> BTreeSet<TableKey> {
     )
 }
 
-fn pick_default_only<'a>(
-    default_only_table: Option<&'a TableKey>,
-    default_only_cte: Option<&'a String>,
-    default_only_derived: Option<&'a String>,
-) -> Option<DefaultOnly<'a>> {
-    default_only_table
-        .map(DefaultOnly::Table)
-        .or_else(|| default_only_cte.map(|c| DefaultOnly::Cte(c.as_str())))
-        .or_else(|| default_only_derived.map(|d| DefaultOnly::Derived(d.as_str())))
-}
-
 #[derive(Debug, Clone)]
 struct ExpandedItem {
     item: SelectItem,
@@ -907,14 +896,42 @@ pub fn analyze_sql_lineage_detailed(sql: &str) -> Result<Vec<ColumnLineageInfo>>
     Ok(out)
 }
 
-fn only_table_in_from(alias_map: &HashMap<String, TableKey>) -> Option<TableKey> {
-    // If only one real table was referenced, return it to disambiguate bare column names.
-    let unique_tables: BTreeSet<_> = alias_map.values().collect();
-    if unique_tables.len() == 1 {
-        unique_tables.iter().next().cloned().cloned()
-    } else {
-        None
+// Determine the single default source (table, CTE, or derived) for bare column references.
+// Returns None if there are multiple sources or mixed types.
+fn determine_default_only<'a>(
+    alias_map: &'a HashMap<String, TableKey>,
+    cte_aliases: &'a HashMap<String, String>,
+    derived_aliases: &'a HashMap<String, DerivedInfo>,
+) -> Option<DefaultOnly<'a>> {
+    // Priority: Table > CTE > Derived
+    // Only return a default if exactly one type has exactly one unique source
+
+    if cte_aliases.is_empty() && derived_aliases.is_empty() {
+        // Only physical tables present
+        let unique_tables: BTreeSet<_> = alias_map.values().collect();
+        if unique_tables.len() == 1 {
+            return unique_tables.iter().next().map(|t| DefaultOnly::Table(t));
+        }
+    } else if alias_map.is_empty() && derived_aliases.is_empty() {
+        // Only CTEs present
+        let unique_ctes: BTreeSet<_> = cte_aliases.values().collect();
+        if unique_ctes.len() == 1 {
+            return unique_ctes
+                .iter()
+                .next()
+                .map(|c| DefaultOnly::Cte(c.as_str()));
+        }
+    } else if alias_map.is_empty() && cte_aliases.is_empty() {
+        // Only derived tables present
+        if derived_aliases.len() == 1 {
+            return derived_aliases
+                .keys()
+                .next()
+                .map(|d| DefaultOnly::Derived(d.as_str()));
+        }
     }
+
+    None
 }
 
 fn qualify_table(ctx: &Context, name: &ObjectName) -> Result<(String, String)> {
@@ -960,6 +977,7 @@ fn analyze_setexpr_info(ctx: &Context, body: &SetExpr, cte_defs: &CteDefs) -> Re
         SetExpr::Select(select) => analyze_select_info(ctx, select, cte_defs),
         SetExpr::Query(inner) => analyze_setexpr_info(ctx, inner.body.as_ref(), cte_defs),
         SetExpr::SetOperation { left, right, .. } => {
+            // detail with union/intersect/except sql
             let left_info = analyze_setexpr_info(ctx, left.as_ref(), cte_defs)?;
             let right_info = analyze_setexpr_info(ctx, right.as_ref(), cte_defs)?;
             merge_derived_info_for_set(left_info, right_info)
@@ -1342,18 +1360,7 @@ fn collect_base_tables_in_scope(
 fn analyze_select_info(ctx: &Context, select: &Select, cte_defs: &CteDefs) -> Result<DerivedInfo> {
     let (alias_map, cte_aliases, derived_aliases) =
         build_alias_map_with_cte(ctx, &select.from, cte_defs)?;
-    let default_only_table = if cte_aliases.is_empty() && derived_aliases.is_empty() {
-        only_table_in_from(&alias_map)
-    } else {
-        None
-    };
-    let default_only_cte = only_cte_in_from(&cte_aliases, &alias_map);
-    let default_only_derived = only_derived_in_from(&derived_aliases, &alias_map, &cte_aliases);
-    let default_only = pick_default_only(
-        default_only_table.as_ref(),
-        default_only_cte.as_ref(),
-        default_only_derived.as_ref(),
-    );
+    let default_only = determine_default_only(&alias_map, &cte_aliases, &derived_aliases);
 
     let expanded = expand_select_items(
         select,
@@ -1543,36 +1550,6 @@ fn build_cte_defs(ctx: &Context, query: &Query) -> Result<CteDefs> {
         }
     }
     Ok(defs)
-}
-
-fn only_cte_in_from(
-    cte_aliases: &HashMap<String, String>,
-    alias_map: &HashMap<String, TableKey>,
-) -> Option<String> {
-    if !alias_map.is_empty() {
-        return None;
-    }
-    let unique: BTreeSet<_> = cte_aliases.values().collect();
-    if unique.len() == 1 {
-        unique.iter().next().cloned().cloned()
-    } else {
-        None
-    }
-}
-
-fn only_derived_in_from(
-    derived_aliases: &HashMap<String, DerivedInfo>,
-    alias_map: &HashMap<String, TableKey>,
-    cte_aliases: &HashMap<String, String>,
-) -> Option<String> {
-    if !alias_map.is_empty() || !cte_aliases.is_empty() {
-        return None;
-    }
-    if derived_aliases.len() == 1 {
-        Some(derived_aliases.keys().next().cloned().unwrap())
-    } else {
-        None
-    }
 }
 
 fn extract_snippet(sql: &str, span: Span) -> String {
